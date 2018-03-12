@@ -333,9 +333,9 @@ OFP port number ranges (eg. 1-6).
       - 255
       - the maximum number of mac addresses that can be learnt on this port.
     * - mirror
-      - integer or string
+      - a list of integers or strings
       - None
-      - Mirror all packets recieved and transmitted on the port
+      - Mirror all packets recieved and transmitted on the ports
         specified (by name or by port number), to this port.
     * - name
       - string
@@ -411,7 +411,7 @@ configuration file. Configuration for each router is an entry in the routers
 dictionary and is keyed by a name for the router. The following attributes can
 be configured:
 
-.. list-table:: routers/<router name>/:
+.. list-table:: routers/<router name>/
     :widths: 31 15 15 60
     :header-rows: 1
 
@@ -432,7 +432,7 @@ VLANs are configured in the 'vlans' configuration block at the top level of
 the faucet config file. The config for each vlan is an entry keyed by its vid
 or a name. The following attributes can be configured:
 
-.. list-table:: vlans/<vlan name or vid>/:
+.. list-table:: vlans/<vlan name or vid>/
     :widths: 31 15 15 60
     :header-rows: 1
 
@@ -454,6 +454,10 @@ or a name. The following attributes can be configured:
       - integer
       - 0
       - The local AS number to used when speaking BGP
+    * - bgp_connect_mode
+      - string
+      - "both"
+      - Whether to try to connect to natives ("active"), listen only ("passive"), or "both".
     * - bgp_local_address
       - string (IP Address)
       - None
@@ -517,7 +521,7 @@ Static routes are given as a list. Each entry in the list contains a dictionary
 keyed with the keyword 'route' and contains a dictionary configuration block as
 follows:
 
-.. list-table:: vlans/<vlan name or vid>/routes/[list]/route/:
+.. list-table:: vlans/<vlan name or vid>/routes/[list]/route/
     :widths: 31 15 15 60
     :header-rows: 1
 
@@ -540,15 +544,14 @@ ACLs
 ACLs are configured under the 'acls' configuration block. The acls block
 contains a dictionary of individual acls each keyed by its name.
 
-Each acl contains a list of rules, a packet will have the first matching rule
+Each acl contains a list of rules: a packet will have the first matching rule
 applied to it.
 
-Each rule is a dictionary containing the single key 'rule' with the value the
-matches and actions for the rule.
+Each rule is a dictionary containing the single key 'rule' with matches
+and actions. Matches are key/values based on the ryu RESTFul API. Actions
+is a dictionary of actions to apply upon match.
 
-The matches are key/values based on the ryu RESTFul API.
-
-.. list-table:: /acls/<acl name>/[list]/rule/actions
+.. list-table:: /acls/<acl name>/[list]/rule/actions/
     :widths: 31 15 15 60
     :header-rows: 1
 
@@ -569,6 +572,10 @@ The matches are key/values based on the ryu RESTFul API.
       - string
       - None
       - meter to apply to the packet
+    * - mirror
+      - string or integer
+      - None
+      - Copy the packet, before any modifications, to the specified port (NOTE: mirroring is done in input direction only)
     * - output
       - dict
       - None
@@ -580,6 +587,10 @@ The output action contains a dictionary with the following elements:
     :widths: 31 15 15 60
     :header-rows: 1
 
+    * - Attribute
+      - Type
+      - Default
+      - Description
     * - set_fields
       - list of dicts
       - None
@@ -588,10 +599,26 @@ The output action contains a dictionary with the following elements:
       - integer or string
       - None
       - The port to output the packet to.
+    * - ports
+      - list of [ integer or string ]
+      - None
+      - The list of ports the packet will be output through.
+    * - pop_vlans
+      - boolean
+      - False
+      - Pop vlan tag before output.
+    * - vlan_vid
+      - integer
+      - False
+      - Push vlan tag before output.
     * - swap_vid
       - integer
       - None
       - Rewrite the vlan vid of the packet when outputting
+    * - vlan_vids
+      - list of [ integer or { integer, eth_type } ]
+      - None
+      - Push vlan tags on output, with optional eth_type.
     * - failover
       - dict
       - None

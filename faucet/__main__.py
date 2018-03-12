@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 """Launch forwarder script for Faucet/Gauge"""
 
 # Copyright (C) 2015 Brad Cowie, Christopher Lorier and Joe Stringer.
@@ -52,7 +54,7 @@ RYU_OPTIONAL_ARGS = [
 ]
 
 
-def parse_args():
+def parse_args(sys_args):
     """Parse Faucet/Gauge arguments.
 
     Returns:
@@ -79,7 +81,7 @@ def parse_args():
     for ryu_arg in RYU_OPTIONAL_ARGS:
         args.add_argument('--ryu-%s' % ryu_arg[0], help=ryu_arg[1])
 
-    return args.parse_args()
+    return args.parse_args(sys_args)
 
 
 def print_version():
@@ -92,7 +94,7 @@ def print_version():
 
 def main():
     """Main program."""
-    args = parse_args()
+    args = parse_args(sys.argv[1:])
     ryu_args = []
 
     # Checking version number?

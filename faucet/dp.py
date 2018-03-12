@@ -17,17 +17,20 @@
 # limitations under the License.
 
 import copy
+import netaddr
 
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 from datadiff import diff
 from netaddr.core import AddrFormatError
 import networkx
 
+from faucet import faucet_pipeline
+from faucet import valve_acl
+from faucet import valve_of
 from faucet.conf import Conf, InvalidConfigError
 from faucet.valve_table import ValveTable, ValveGroupTable
 from faucet.valve_util import get_setting
-from faucet import valve_acl
-from faucet import valve_of
+from faucet.valve_packet import FAUCET_MAC
 
 
 # Documentation generated using documentation_generator.py
@@ -80,6 +83,8 @@ configuration.
     timeout = None
     arp_neighbor_timeout = None
     lldp_beacon = {} # type: dict
+    metrics_rate_limit_sec = None
+    faucet_dp_mac = None
 
     dyn_last_coldstart_time = None
 
@@ -112,7 +117,7 @@ configuration.
         # OF channel log
         'stack': None,
         # stacking config, when cross connecting multiple DPs
-        'ignore_learn_ins': 3,
+        'ignore_learn_ins': 10,
         # Ignore every approx nth packet for learning.
         # 2 will ignore 1 out of 2 packets; 3 will ignore 1 out of 3 packets.
         # This limits control plane activity when learning new hosts rapidly.
@@ -152,6 +157,10 @@ configuration.
         # Turn on/off the use of idle timeout for src_table, default OFF.
         'lldp_beacon': {},
         # Config for LLDP beacon service.
+        'metrics_rate_limit_sec': 0,
+        # Rate limit metric updates - don't update metrics if last update was less than this many seconds ago.
+        'faucet_dp_mac': FAUCET_MAC,
+        # MAC address of packets sent by FAUCET, not associated with any VLAN.
         }
 
     defaults_types = {
@@ -189,6 +198,8 @@ configuration.
         'pipeline_config_dir': str,
         'use_idle_timeout': bool,
         'lldp_beacon': dict,
+        'metrics_rate_limit_sec': int,
+        'faucet_dp_mac': str,
     }
 
     stack_defaults_types = {
@@ -222,6 +233,7 @@ configuration.
     def check_config(self):
         assert isinstance(self.dp_id, int), 'dp_id must be %s not %s' % (int, type(self.dp_id))
         assert self.dp_id > 0 and self.dp_id <= 2**64-1, 'DP ID %s not in valid range' % self.dp_id
+        assert netaddr.valid_mac(self.faucet_dp_mac), 'invalid MAC address %s' % self.faucet_dp_mac
         assert not (self.group_table and self.group_table_routing), (
             'groups for routing and other functions simultaneously not supported')
         assert (self.interfaces or self.interface_ranges), (
@@ -244,16 +256,7 @@ configuration.
     def _configure_tables(self):
         """Configure FAUCET pipeline of tables with matches."""
         self.groups = ValveGroupTable()
-        for table_id, table_config in enumerate((
-                ('port_acl', None),
-                ('vlan', ('eth_dst', 'eth_type', 'in_port', 'vlan_vid')),
-                ('vlan_acl', None),
-                ('eth_src', ('eth_dst', 'eth_src', 'eth_type', 'in_port', 'vlan_vid')),
-                ('ipv4_fib', ('eth_type', 'ipv4_dst', 'vlan_vid')),
-                ('ipv6_fib', ('eth_type', 'ipv6_dst', 'vlan_vid')),
-                ('vip', ('arp_tpa', 'eth_dst', 'eth_type', 'icmpv6_type', 'ip_proto')),
-                ('eth_dst', ('eth_dst', 'in_port', 'vlan_vid')),
-                ('flood', ('eth_dst', 'in_port', 'vlan_vid')))):
+        for table_id, table_config in enumerate(faucet_pipeline.FAUCET_PIPELINE):
             table_name, restricted_match_types = table_config
             self.tables[table_name] = ValveTable(
                 table_id, table_name, restricted_match_types,
@@ -264,10 +267,10 @@ configuration.
         super(DP, self).set_defaults()
         self._set_default('dp_id', self._id)
         self._set_default('name', str(self._id))
-        self._set_default('lowest_priority', self.priority_offset) # pytype: disable=none-attr
-        self._set_default('low_priority', self.priority_offset + 9000) # pytype: disable=none-attr
-        self._set_default('high_priority', self.low_priority + 1) # pytype: disable=none-attr
-        self._set_default('highest_priority', self.high_priority + 98) # pytype: disable=none-attr
+        self._set_default('lowest_priority', self.priority_offset)
+        self._set_default('low_priority', self.priority_offset + 9000)
+        self._set_default('high_priority', self.low_priority + 1)
+        self._set_default('highest_priority', self.high_priority + 98)
         self._set_default('description', self.name)
         self._configure_tables()
 
@@ -426,15 +429,28 @@ configuration.
     def finalize_config(self, dps):
         """Perform consistency checks after initial config parsing."""
 
-        def resolve_port_no(port_name):
+        def resolve_port(port_name):
             """Resolve port by name or number."""
             assert isinstance(port_name, (str, int)), (
-                'VLAN must be type %s or %s not %s' % (str, int, type(port_name)))
+                'Port must be type %s or %s not %s' % (str, int, type(port_name)))
             if port_name in port_by_name:
-                return port_by_name[port_name].number
+                return port_by_name[port_name]
             elif port_name in self.ports:
-                return port_name
+                return self.ports[port_name]
             return None
+
+        def resolve_ports(port_names):
+            """Resolve list of ports, by port by name or number."""
+            resolved_ports = []
+            for port_name in port_names:
+                port = resolve_port(port_name)
+                if port is not None:
+                    resolved_ports.append(port)
+            return resolved_ports
+
+        def resolve_port_numbers(port_names):
+            """Resolve list of ports to numbers, by port by name or number."""
+            return [port.number for port in resolve_ports(port_names)]
 
         def resolve_vlan(vlan_name):
             """Resolve VLAN by name or VID."""
@@ -462,22 +478,29 @@ configuration.
 
         def resolve_mirror_destinations():
             """Resolve mirror port references and destinations."""
-            mirror_from_port = {}
-            for port in list(self.ports.values()):
-                if port.mirror is not None:
-                    if port.mirror in port_by_name:
-                        mirror_from_port[port] = port_by_name[port.mirror]
-                    else:
-                        assert port.mirror in self.ports, 'mirror port %s not defined in DP %s' % (
-                            port.mirror, self.name)
-                        mirror_from_port[self.ports[port.mirror]] = port
-            for port, mirror_destination_port in list(mirror_from_port.items()):
-                port.mirror = mirror_destination_port.number
-                mirror_destination_port.output_only = True
+            mirror_from_port = defaultdict(list)
+            for mirror_port in list(self.ports.values()):
+                if mirror_port.mirror is not None:
+                    mirrored_ports = resolve_ports(mirror_port.mirror)
+                    assert len(mirrored_ports) == len(mirror_port.mirror), (
+                        'port mirror not defined in DP %s' % self.name)
+                    for mirrored_port in mirrored_ports:
+                        mirror_from_port[mirrored_port].append(mirror_port)
 
-        def resolve_acls():
-            """Resolve config references in ACLs."""
-            # TODO: move this config validation to ACL object.
+            # TODO: confusingly, mirror at config time means what ports to mirror from.
+            # But internally we use as a list of ports to mirror to.
+            for mirrored_port, mirror_ports in list(mirror_from_port.items()):
+                mirrored_port.mirror = []
+                for mirror_port in mirror_ports:
+                    mirrored_port.mirror.append(mirror_port.number)
+                    mirror_port.output_only = True
+
+        def resolve_acl(acl_in):
+            """Resolve an individual ACL."""
+            assert acl_in in self.acls, (
+                'missing ACL %s on %s' % (self.name, acl_in))
+            acl = self.acls[acl_in]
+            mirror_destinations = set()
 
             def resolve_meter(_acl, action_conf):
                 meter_name = action_conf
@@ -487,11 +510,11 @@ configuration.
 
             def resolve_mirror(acl, action_conf):
                 port_name = action_conf
-                port_no = resolve_port_no(port_name)
+                port = resolve_port(port_name)
                 # If this DP does not have this port, do nothing.
-                if port_no is not None:
-                    action_conf = port_no
-                    acl.mirror_destinations.add(port_no)
+                if port is not None:
+                    action_conf = port.number
+                    mirror_destinations.add(port.number)
                     return action_conf
                 return None
 
@@ -501,24 +524,21 @@ configuration.
                 for output_action, output_action_values in list(action_conf.items()):
                     if output_action == 'port':
                         port_name = output_action_values
-                        port_no = resolve_port_no(port_name)
+                        port = resolve_port(port_name)
                         # If this DP does not have this port, do not output.
-                        if port_no is not None:
-                            resolved_action_conf[output_action] = port_no
+                        if port is not None:
+                            resolved_action_conf[output_action] = port.number
+                    elif output_action == 'ports':
+                        resolved_action_conf[output_action] = resolve_port_numbers(
+                            output_action_values)
                     elif output_action == 'failover':
                         failover = output_action_values
                         assert isinstance(failover, dict)
                         resolved_action_conf[output_action] = {}
                         for failover_name, failover_values in list(failover.items()):
                             if failover_name == 'ports':
-                                resolved_ports = []
-                                for port_name in failover_values:
-                                    port_no = resolve_port_no(port_name)
-                                    if port_no is not None:
-                                        resolved_ports.append(port_no)
-                                resolved_action_conf[output_action][failover_name] = resolved_ports
-                            else:
-                                resolved_action_conf[output_action][failover_name] = failover_values
+                                failover_values = resolve_port_numbers(failover_values)
+                            resolved_action_conf[output_action][failover_name] = failover_values
                     else:
                         resolved_action_conf[output_action] = output_action_values
                 if resolved_action_conf:
@@ -527,6 +547,13 @@ configuration.
 
             def resolve_allow(_acl, action_conf):
                 return action_conf
+
+            action_resolvers = {
+                'meter': resolve_meter,
+                'mirror': resolve_mirror,
+                'output': resolve_output,
+                'allow': resolve_allow,
+            }
 
             def build_acl(acl, vid=None):
                 """Check that ACL can be built from config and mark mirror destinations."""
@@ -546,63 +573,50 @@ configuration.
                             ofmsg.serialize()
                     except (AddrFormatError, KeyError, ValueError) as err:
                         raise InvalidConfigError(err)
-                    for port_no in acl.mirror_destinations:
+                    for port_no in mirror_destinations:
                         port = self.ports[port_no]
                         port.output_only = True
 
-            def resolve_acl(acl_in):
-                assert acl_in in self.acls, (
-                    'missing ACL %s on %s' % (self.name, acl_in))
-                acl = self.acls[acl_in]
+            for rule_conf in acl.rules:
+                for attrib, attrib_value in list(rule_conf.items()):
+                    if attrib == 'actions':
+                        resolved_actions = {}
+                        assert isinstance(attrib_value, dict)
+                        for action_name, action_conf in list(attrib_value.items()):
+                            resolved_action_conf = action_resolvers[action_name](
+                                acl, action_conf)
+                            assert resolved_action_conf is not None, (
+                                'cannot resolve ACL rule %s' % rule_conf)
+                            resolved_actions[action_name] = resolved_action_conf
+                        rule_conf[attrib] = resolved_actions
 
-                action_resolvers = {
-                    'meter': resolve_meter,
-                    'mirror': resolve_mirror,
-                    'output': resolve_output,
-                    'allow': resolve_allow,
-                }
+            build_acl(acl, vid=1)
 
-                for rule_conf in acl.rules:
-                    for attrib, attrib_value in list(rule_conf.items()):
-                        if attrib == 'actions':
-                            resolved_actions = {}
-                            assert isinstance(attrib_value, dict)
-                            for action_name, action_conf in list(attrib_value.items()):
-                                resolved_action_conf = action_resolvers[action_name](
-                                    acl, action_conf)
-                                assert resolved_action_conf is not None, (
-                                    'cannot resolve ACL rule %s' % rule_conf)
-                                resolved_actions[action_name] = resolved_action_conf
-                            rule_conf[attrib] = resolved_actions
+        def verify_acl_exact_match(acls):
+            for acl in acls:
+                assert acl.exact_match == acls[0].exact_match, (
+                    'ACLs when used together must have consistent exact_match')
 
-                build_acl(acl, vid=1)
+        def resolve_acls():
+            """Resolve config references in ACLs."""
+            # TODO: move this config validation to ACL object.
 
             for vlan in list(self.vlans.values()):
                 if vlan.acls_in:
                     acls = []
-                    exact_all_set = True
-                    exact_set = False
                     for acl in vlan.acls_in:
                         resolve_acl(acl)
                         acls.append(self.acls[acl])
-                        exact_all_set &= bool(acls[-1].exact_match)
-                        exact_set |= bool(acls[-1].exact_match)
-                    if exact_set != exact_all_set:
-                        assert False, 'if one exact match is set, all acls must be an exact match'
                     vlan.acls_in = acls
+                    verify_acl_exact_match(acls)
             for port in list(self.ports.values()):
                 if port.acls_in:
                     acls = []
-                    exact_all_set = True
-                    exact_set = False
                     for acl in port.acls_in:
                         resolve_acl(acl)
                         acls.append(self.acls[acl])
-                        exact_all_set &= bool(acls[-1].exact_match)
-                        exact_set |= bool(acls[-1].exact_match)
-                    if exact_set != exact_all_set:
-                        assert False, 'if one exact match is set, all acls must be an exact match'
                     port.acls_in = acls
+                    verify_acl_exact_match(acls)
 
         def resolve_vlan_names_in_routers():
             """Resolve VLAN references in routers."""
@@ -636,11 +650,19 @@ configuration.
         resolve_vlan_names_in_routers()
         resolve_acls()
 
-        for vlan in list(self.vlans.values()):
-            if vlan.bgp_routerid:
+        bgp_vlans = self.bgp_vlans()
+        if bgp_vlans:
+            for vlan in bgp_vlans:
                 vlan_dps = [dp for dp in dps if vlan.vid in dp.vlans]
                 assert len(vlan_dps) == 1, (
                     'DPs %s sharing a BGP speaker VLAN is unsupported')
+            router_ids = set([vlan.bgp_routerid for vlan in bgp_vlans])
+            assert len(router_ids) == 1, 'BGP router IDs must all be the same'
+            bgp_ports = set([vlan.bgp_port for vlan in bgp_vlans])
+            assert len(bgp_ports) == 1, 'BGP ports must all be the same'
+            for vlan in bgp_vlans:
+                assert vlan.bgp_server_addresses == bgp_vlans[0].bgp_server_addresses, (
+                    'BGP server addresses must all be the same')
 
         for port in list(self.ports.values()):
             port.finalize()
@@ -657,6 +679,10 @@ configuration.
         if port_num in self.ports:
             return self.ports[port_num].native_vlan
         return None
+
+    def bgp_vlans(self):
+        """Return list of VLANs with BGP enabled."""
+        return [vlan for vlan in list(self.vlans.values()) if vlan.bgp_as]
 
     def to_conf(self):
         """Return DP config as dict."""
@@ -787,21 +813,22 @@ configuration.
                             changed_acl_ports.add(port_no)
                             old_acl_ids = old_port.acls_in
                             if old_acl_ids:
-                                old_acl_ids = [x._id for x in old_acl_ids]
+                                old_acl_ids = [acl._id for acl in old_acl_ids]
                             new_acl_ids = new_port.acls_in
                             if new_acl_ids:
-                                new_acl_ids = [x._id for x in new_acl_ids]
+                                new_acl_ids = [acl._id for acl in new_acl_ids]
                             logger.info('port %s ACL changed (ACL %s to %s)' % (
                                 port_no, old_acl_ids, new_acl_ids))
                     else:
                         changed_ports.add(port_no)
                         logger.info('port %s reconfigured (%s)' % (
                             port_no, diff(old_port.to_conf(), new_port.to_conf(), context=1)))
-                elif new_port.acls_in and len([x for x in new_port.acls_in if x in changed_acls]):
-                    # If the port has ACL changed.
-                    changed_acl_ports.add(port_no)
-                    logger.info('port %s ACL changed (ACL %s content changed)' % (
-                        port_no, [x._id for x in new_port.acls_in]))
+                elif new_port.acls_in:
+                    port_acls_changed = [acl for acl in new_port.acls_in if acl in changed_acls]
+                    if port_acls_changed:
+                        changed_acl_ports.add(port_no)
+                        logger.info('port %s ACL changed (ACL %s content changed)' % (
+                            port_no, port_acls_changed))
 
         # TODO: optimize case where only VLAN ACL changed.
         for vid in changed_vlans:

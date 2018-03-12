@@ -52,10 +52,10 @@ class ValveHostManager(object):
         eth_src = pkt_meta.eth_src
         vlan = pkt_meta.vlan
 
-        if eth_src not in vlan.dyn_host_cache:
+        entry = vlan.cached_host(eth_src)
+        if entry is None:
             if port.max_hosts:
-                hosts = port.hosts()
-                if len(hosts) == port.max_hosts:
+                if port.hosts_count() == port.max_hosts:
                     ofmsgs.append(self._temp_ban_host_learning_on_port(port))
                     port.dyn_learn_ban_count += 1
                     self.logger.info(
@@ -63,7 +63,7 @@ class ValveHostManager(object):
                         'temporarily banning learning on this port, '
                         'and not learning %s' % (
                             port.max_hosts, port, eth_src))
-            if vlan.max_hosts:
+            if vlan is not None and vlan.max_hosts:
                 hosts_count = vlan.hosts_count()
                 if hosts_count == vlan.max_hosts:
                     ofmsgs.append(self._temp_ban_host_learning_on_vlan(vlan))
@@ -306,7 +306,7 @@ class ValveHostFlowRemovedManager(ValveHostManager):
         ofmsgs = []
         entry = vlan.cached_host_on_port(eth_src, port)
         if entry is not None:
-            entry.expired = True
+            vlan.expire_cache_host(eth_src)
             self.logger.info('expired src_rule for host %s' % eth_src)
         return ofmsgs
 
@@ -315,11 +315,10 @@ class ValveHostFlowRemovedManager(ValveHostManager):
         traffic but not receving. If the src rule not yet expires, we reinstall
         host rules."""
         ofmsgs = []
-        if eth_dst in vlan.dyn_host_cache:
-            entry = vlan.dyn_host_cache[eth_dst]
-            if not entry.expired:
-                ofmsgs.extend(self.learn_host_on_vlan_ports(
-                    entry.port, vlan, eth_dst, delete_existing=False))
-                self.logger.info(
-                    'refreshing host %s from VLAN %u' % (eth_dst, vlan.vid))
+        entry = vlan.cached_host(eth_dst)
+        if entry is not None:
+            ofmsgs.extend(self.learn_host_on_vlan_ports(
+                entry.port, vlan, eth_dst, delete_existing=False))
+            self.logger.info(
+                'refreshing host %s from VLAN %u' % (eth_dst, vlan.vid))
         return ofmsgs

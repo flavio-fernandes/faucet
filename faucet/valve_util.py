@@ -68,11 +68,12 @@ DEFAULTS = {
     'FAUCET_EVENT_SOCK': '',  # Special-case, see get_setting().
     'FAUCET_EXCEPTION_LOG': _PREFIX + '/var/log/ryu/faucet/faucet_exception.log',
     'FAUCET_PROMETHEUS_PORT': '9302',
-    'FAUCET_PROMETHEUS_ADDR': '',
+    'FAUCET_PROMETHEUS_ADDR': '0.0.0.0',
     'FAUCET_PIPELINE_DIR': _PREFIX + '/etc/ryu/faucet',
     'GAUGE_CONFIG': _PREFIX + '/etc/ryu/faucet/gauge.yaml',
     'GAUGE_CONFIG_STAT_RELOAD': False,
     'GAUGE_LOG_LEVEL': 'INFO',
+    'GAUGE_PROMETHEUS_ADDR': '0.0.0.0',
     'GAUGE_EXCEPTION_LOG': _PREFIX + '/var/log/ryu/faucet/gauge_exception.log',
     'GAUGE_LOG': _PREFIX + '/var/log/ryu/faucet/gauge.log',
 }
@@ -111,9 +112,13 @@ def get_logger(logname, logfile, loglevel, propagate):
     }
 
     try:
-        logger_handler = logging.StreamHandler(stream_handlers[logfile])
-    except KeyError:
-        logger_handler = WatchedFileHandler(logfile)
+        if logfile in stream_handlers:
+            logger_handler = logging.StreamHandler(stream_handlers[logfile])
+        else:
+            logger_handler = WatchedFileHandler(logfile)
+    except PermissionError as err: # pytype: disable=name-error
+        print(err)
+        sys.exit(-1)
 
     logger = logging.getLogger(logname)
     log_fmt = '%(asctime)s %(name)-6s %(levelname)-8s %(message)s'

@@ -24,18 +24,25 @@
 
 # pytype: disable=pyi-error
 # pytype: disable=import-error
-import getopt
+import argparse
 import sys
 import time
-import urllib.request, urllib.parse, urllib.error
+import urllib.error
+import urllib.parse
+import urllib.request
 import requests
 from prometheus_client import parser
 
 # TODO: byte/packet counters could be per second (given multiple samples)
-VAL_DECODE = {
-    'learned_macs': lambda mac: ':'.join(format(octet, '02x') for octet in int(mac).to_bytes(6, byteorder='big')) # pytype: disable=attribute-error
-}
-
+def decode_value(metric_name, value):
+    """Convert values to human readible format based on metric name"""
+    result = value
+    if metric_name == 'learned_macs':
+        result = ':'.join(
+            format(octet, '02x') for octet in int(value).to_bytes( # pytype: disable=attribute-error
+                6, byteorder='big')
+            )
+    return result
 
 def scrape_prometheus(endpoints, retries=3):
     """Scrape a list of Prometheus/FAUCET/Gauge endpoints and aggregate results."""
@@ -59,45 +66,44 @@ def scrape_prometheus(endpoints, retries=3):
                 time.sleep(1)
         if err is not None:
             print(err)
-            sys.exit(1)
+            return None
         endpoint_metrics = parser.text_string_to_metric_families(
             content)
         metrics.extend(endpoint_metrics)
     return metrics
 
-
-def report_label_match_metrics(report_metrics, metrics,
+def report_label_match_metrics(report_metrics, metrics, display_labels=None,
                                nonzero_only=False, delim='\t', label_matches=None):
     """Text report on a list of Prometheus metrics."""
+    report_output = []
     for metric in metrics:
         if not report_metrics or metric.name in report_metrics:
             for _, labels, value in metric.samples:
-                if label_matches is None or \
-                    (label_matches and set(label_matches.items()).issubset(set(labels.items()))):
+                if (label_matches is None or
+                        (label_matches and set(
+                            label_matches.items()).issubset(set(labels.items())))):
                     if nonzero_only and int(value) == 0:
                         continue
-                    try:
-                        value = VAL_DECODE[metric.name](value)
-                    except KeyError:
-                        pass
-                    sorted_labels = [(k, v) for k, v in sorted(labels.items())]
-                    print((delim.join((metric.name, str(sorted_labels), str(value)))))
+
+                    sorted_labels = []
+                    for key, val in sorted(labels.items()):
+                        if not display_labels or key in display_labels:
+                            sorted_labels.append((key, val))
+                    value = decode_value(metric.name, value)
+                    report_output.append(
+                        delim.join((metric.name, str(sorted_labels), str(value)))
+                        )
+    report_output = '\n'.join(report_output)
+    return report_output
 
 
-def usage():
-    usage_vars = {'self': sys.argv[0]}
-    print(("""
-Retrieve FAUCET/Gauge state using Prometheus variables.
+def parse_args(sys_args):
+    """Parse and return CLI args."""
 
-    {self} [-n] <-e|--endpoints=http://server:port> [-m|--metrics=prometheus_metrics,] [-l|--labels=name:value,]
-
-    -n: Don't report 0 values
-    -e|--endpoints: list of Prometheus endpoints to query (comma separated)
-    -m|--metrics: list of Prometheus variables to query (comma separated)
-    -l|--labels: filter list of Prometheus variables by labels that must be present (comma separated)
-
-Examples:
-
+    parser = argparse.ArgumentParser(
+        prog='fctl',
+        description='Retrieve FAUCET/Gauge state using Prometheus variables.',
+        usage="""
     MACs learned on a DP.
 
     {self} -n --endpoints=http://172.17.0.1:9302 --metrics=learned_macs --labels=dp_id:0xb827eb608918
@@ -105,41 +111,65 @@ Examples:
     Status of all DPs
 
     {self} -n --endpoints=http://172.17.0.1:9302 --metrics=dp_status
-""".format(**usage_vars))) # pytype: disable=duplicate-keyword-argument
-    sys.exit(-1)
-
-
-def main():
-    try:
-        opts, _ = getopt.getopt(
-            sys.argv[1:], 'ne:m:l:', ['nonzero', 'endpoints=', 'metrics=', 'labels='])
-    except getopt.GetoptError:
-        usage()
+""".format(**{'self': sys.argv[0]})) # pytype: disable=duplicate-keyword-argument
+    parser.add_argument(
+        '-n', '--nonzero', action='store_true', help='nonzero results only')
+    parser.add_argument(
+        '-e', '--endpoints', help='list of endpoint URLs to query')
+    parser.add_argument(
+        '-m', '--metrics', help='list of metrics to query')
+    parser.add_argument(
+        '-l', '--labels', help='list of labels that must be present')
+    parser.add_argument(
+        '--display-labels', help='list of labels to filter display by (default all)')
 
     endpoints = []
     report_metrics = []
     label_matches = None
+    display_labels = None
     nonzero_only = False
 
-    for opt, arg in opts:
-        if opt in ('-n', '--nonzero'):
+    try:
+        args = parser.parse_args(sys_args)
+        if args.nonzero:
             nonzero_only = True
-        elif opt in ('-e', '--endpoints'):
-            endpoints = arg.split(',')
-        elif opt in ('-m', '--metrics'):
-            report_metrics = arg.split(',')
-        elif opt in ('-l', '--labels'):
-            for label_value in arg.split(','):
+        if args.endpoints:
+            endpoints = args.endpoints.split(',')
+        if args.metrics:
+            report_metrics = args.metrics.split(',')
+        if args.labels:
+            label_matches = {}
+            for label_value in args.labels.split(','):
                 label, value = label_value.split(':')
-                if label_matches is None:
-                    label_matches = {}
                 label_matches[label] = value
-        else:
-            usage()
+        if args.display_labels:
+            display_labels = args.display_labels.split(',')
+    except (KeyError, IndexError):
+        parser.print_usage()
+        sys.exit(-1)
 
+    return (endpoints, report_metrics, label_matches, nonzero_only, display_labels)
+
+
+def main():
+    (
+        endpoints,
+        report_metrics,
+        label_matches,
+        nonzero_only,
+        display_labels
+        ) = parse_args(sys.argv[1:])
     metrics = scrape_prometheus(endpoints)
-    report_label_match_metrics(
-        report_metrics, metrics, nonzero_only=nonzero_only, label_matches=label_matches)
+    if metrics is None:
+        sys.exit(1)
+    report = report_label_match_metrics(
+        report_metrics,
+        metrics,
+        nonzero_only=nonzero_only,
+        label_matches=label_matches,
+        display_labels=display_labels
+        )
+    print(report)
 
 
 if __name__ == '__main__':

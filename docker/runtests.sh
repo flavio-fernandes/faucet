@@ -1,11 +1,11 @@
 #!/bin/bash
 
 DEPCHECK=1
-MINCOVERAGE=69
+MINCOVERAGE=75
 
 TMPDIR=$(mktemp -d /tmp/$(basename $0).XXXXXX)
 
-# if -n passed, don't check dependencies/lint/type.
+# if -n passed, don't check dependencies/lint/type/documentation.
 # wrapper script only cares about -n, others passed to test suite.
 while getopts "cdknsx" o $FAUCET_TESTS; do
   case "${o}" in
@@ -27,21 +27,21 @@ export OVS_LOGDIR=/usr/local/var/log/openvswitch
 ovs-vsctl show || exit 1
 ovs-vsctl --no-wait set Open_vSwitch . other_config:max-idle=50000
 
-# enable fast reuse of ports.
-sysctl -w net.netfilter.nf_conntrack_tcp_timeout_time_wait=10
-sysctl -w net.ipv4.tcp_fin_timeout=10
-sysctl -w net.ipv4.tcp_tw_recycle=1
-sysctl -w net.ipv4.tcp_tw_reuse=1
-# minimize TCP connection timeout so application layer timeouts are quicker to test.
-sysctl -w net.ipv4.tcp_syn_retries=4
-
 cd /faucet-src/tests
 
+./sysctls_for_tests.sh
+
 if [ "$DEPCHECK" == 1 ] ; then
+    echo "========== Building documentation =========="
+    cd /faucet-src/docs
+    make html || exit 1
+    rm -rf _build
+
     echo "============ Running pytype analyzer ============"
+    cd /faucet-src/tests
     # TODO: pytype doesn't completely understand py3 yet.
-    # TODO: re-enable pytype Docker test base image rebuilt.
-    ls -1 ../faucet/*py | parallel pytype -d import-error || exit 1
+    ls -1 ../faucet/*py | parallel pytype -d pyi-error,import-error || exit 1
+
 fi
 
 echo "========== Running faucet unit tests =========="

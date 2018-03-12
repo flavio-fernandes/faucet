@@ -17,7 +17,7 @@
 # limitations under the License.
 
 from faucet.conf import Conf
-from faucet.valve_of import ignore_port
+from faucet import valve_of
 
 
 class Port(Conf):
@@ -42,6 +42,7 @@ class Port(Conf):
     output_only = None
     lldp_beacon = {} # type: dict
     op_status_reconf = None
+    receive_lldp = None
 
     dyn_learn_ban_count = 0
     dyn_phys_up = False
@@ -84,6 +85,8 @@ class Port(Conf):
         # LLDP beacon configuration for this port.
         'opstatus_reconf': True,
         # If True, configure pipeline if operational status of port changes.
+        'receive_lldp': False,
+        # If True, receive LLDP on this port.
     }
 
     defaults_types = {
@@ -93,7 +96,7 @@ class Port(Conf):
         'enabled': bool,
         'permanent_learn': bool,
         'unicast_flood': bool,
-        'mirror': (str, int),
+        'mirror': (list, str, int),
         'native_vlan': (str, int),
         'tagged_vlans': list,
         'acl_in': (str, int),
@@ -106,6 +109,7 @@ class Port(Conf):
         'output_only': bool,
         'lldp_beacon': dict,
         'opstatus_reconf': bool,
+        'receive_lldp': bool,
     }
 
     stack_defaults_types = {
@@ -130,6 +134,10 @@ class Port(Conf):
         super(Port, self).__init__(_id, dp_id, conf)
         self.dyn_phys_up = False
 
+        # If the port is mirrored convert single attributes to a array
+        if self.mirror and not isinstance(self.mirror, list):
+            self.mirror = [self.mirror]
+
     def __str__(self):
         return 'Port %u' % self.number
 
@@ -145,7 +153,7 @@ class Port(Conf):
 
     def check_config(self):
         super(Port, self).check_config()
-        assert isinstance(self.number, int) and self.number > 0 and not ignore_port(self.number), (
+        assert isinstance(self.number, int) and self.number > 0 and not valve_of.ignore_port(self.number), (
             'Port number invalid: %s' % self.number)
         if self.mirror:
             assert not self.tagged_vlans and not self.native_vlan, (
@@ -160,7 +168,6 @@ class Port(Conf):
             self.lldp_beacon = self._set_unknown_conf(
                 self.lldp_beacon, self.lldp_beacon_defaults_types)
             if self.lldp_beacon_enabled():
-                assert self.native_vlan, 'native_vlan must be defined for LLDP beacon'
                 if self.lldp_beacon['port_descr'] is None:
                     self.lldp_beacon['port_descr'] = self.description
 
@@ -170,10 +177,10 @@ class Port(Conf):
                     assert len(org_tlv) == len(self.lldp_org_tlv_defaults_types), (
                         'missing org_tlv config')
                     try:
-                        org_tlv['info'] = bytearray.fromhex(org_tlv['info'])
+                        org_tlv['info'] = bytearray.fromhex(org_tlv['info']) # pytype: disable=missing-parameter
                     except ValueError:
                         org_tlv['info'] = org_tlv['info'].encode('utf-8')
-                    org_tlv['oui'] = bytearray.fromhex('%6.6x' % org_tlv['oui'])
+                    org_tlv['oui'] = bytearray.fromhex('%6.6x' % org_tlv['oui']) # pytype: disable=missing-parameter
                     org_tlvs.append(org_tlv)
                 self.lldp_beacon['org_tlvs'] = org_tlvs
         if self.acl_in and self.acls_in:
@@ -214,14 +221,29 @@ class Port(Conf):
         return self.tagged_vlans
 
     def hosts(self, vlans=None):
-        """Return all hosts this port has learned (on all or specified VLANs)."""
+        """Return all host cache entries this port has learned (on all or specified VLANs)."""
         if vlans is None:
             vlans = self.vlans()
         hosts = []
         for vlan in vlans:
-            hosts.extend([entry.eth_src for entry in list(vlan.cached_hosts_on_port(self))])
+            hosts.extend([entry for entry in list(vlan.cached_hosts_on_port(self))])
         return hosts
+
+    def hosts_count(self, vlans=None):
+        """Return count of all hosts this port has learned (on all or specified VLANs)."""
+        if vlans is None:
+            vlans = self.vlans()
+        hosts_count = 0
+        for vlan in vlans:
+            hosts_count += vlan.cached_hosts_count_on_port(self)
+        return hosts_count
 
     def lldp_beacon_enabled(self):
         """Return True if LLDP beacon enabled on this port."""
         return self.lldp_beacon and self.lldp_beacon.get('enable', False)
+
+    def mirror_actions(self):
+        """Return OF actions to mirror this port."""
+        if self.mirror is not None:
+            return [valve_of.output_port(mirror_port) for mirror_port in self.mirror]
+        return []

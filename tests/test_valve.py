@@ -17,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import namedtuple
 import ipaddress
 import logging
 import os
@@ -29,13 +30,15 @@ from ryu.lib import mac
 from ryu.lib.packet import arp, ethernet, icmp, icmpv6, ipv4, ipv6, packet, vlan
 from ryu.ofproto import ether, inet
 from ryu.ofproto import ofproto_v1_3 as ofp
+from ryu.ofproto import ofproto_v1_3_parser as parser
 
 from prometheus_client import CollectorRegistry
 
-from faucet.config_parser import dp_parser
-from faucet.valve import valve_factory
+from faucet import faucet_bgp
 from faucet import faucet_experimental_event
 from faucet import faucet_metrics
+from faucet import valve
+from faucet import valves_manager
 from faucet import valve_of
 from faucet import valve_packet
 from faucet import valve_util
@@ -43,17 +46,42 @@ from faucet import valve_util
 from fakeoftable import FakeOFTable
 
 
+FAUCET_MAC = '0e:00:00:00:00:01'
+
+
 def build_pkt(pkt):
     """Build and return a packet and eth type from a dict."""
+
+    def serialize(layers):
+        """Concatenate packet layers and serialize."""
+        result = packet.Packet()
+        for layer in reversed(layers):
+            result.add_protocol(layer)
+        result.serialize()
+        return result
+
     layers = []
     assert 'eth_dst' in pkt and 'eth_src' in pkt
     ethertype = None
     if 'arp_source_ip' in pkt and 'arp_target_ip' in pkt:
         ethertype = ether.ETH_TYPE_ARP
-        layers.append(arp.arp(src_ip=pkt['arp_source_ip'], dst_ip=pkt['arp_target_ip']))
+        arp_code = arp.ARP_REQUEST
+        if pkt['eth_dst'] == FAUCET_MAC:
+            arp_code = arp.ARP_REPLY
+        layers.append(arp.arp(
+            src_ip=pkt['arp_source_ip'], dst_ip=pkt['arp_target_ip'], opcode=arp_code))
     elif 'ipv6_src' in pkt and 'ipv6_dst' in pkt:
         ethertype = ether.ETH_TYPE_IPV6
-        if 'neighbor_solicit_ip' in pkt:
+        if 'router_solicit_ip' in pkt:
+            layers.append(icmpv6.icmpv6(
+                type_=icmpv6.ND_ROUTER_SOLICIT))
+        elif 'neighbor_advert_ip' in pkt:
+            layers.append(icmpv6.icmpv6(
+                type_=icmpv6.ND_NEIGHBOR_ADVERT,
+                data=icmpv6.nd_neighbor(
+                    dst=pkt['neighbor_advert_ip'],
+                    option=icmpv6.nd_option_sla(hw_src=pkt['eth_src']))))
+        elif 'neighbor_solicit_ip' in pkt:
             layers.append(icmpv6.icmpv6(
                 type_=icmpv6.ND_NEIGHBOR_SOLICIT,
                 data=icmpv6.nd_neighbor(
@@ -87,12 +115,8 @@ def build_pkt(pkt):
         src=pkt['eth_src'],
         ethertype=tpid)
     layers.append(eth)
-    layers = [layer for layer in reversed(layers)]
-    result = packet.Packet()
-    for layer in layers:
-        result.add_protocol(layer)
-    result.serialize()
-    return (result, ethertype)
+    result = serialize(layers)
+    return result
 
 
 class ValveTestBase(unittest.TestCase):
@@ -102,9 +126,10 @@ class ValveTestBase(unittest.TestCase):
 dps:
     s1:
         ignore_learn_ins: 0
-        hardware: 'Open vSwitch'
         dp_id: 1
         ofchannel_log: "/dev/null"
+        hardware: 'GenericTFM'
+        pipeline_config_dir: '%s/../etc/ryu/faucet'
         lldp_beacon:
             send_interval: 1
             max_per_interval: 1
@@ -208,7 +233,7 @@ vlans:
         vid: 0x300
     v400:
         vid: 0x400
-"""
+""" % os.path.dirname(os.path.realpath(__file__))
 
     DP = 's1'
     DP_ID = 1
@@ -218,131 +243,114 @@ vlans:
     P2_V200_MAC = '00:00:00:02:00:02'
     P3_V200_MAC = '00:00:00:02:00:03'
     UNKNOWN_MAC = '00:00:00:04:00:04'
-    FAUCET_MAC = '0e:00:00:00:00:01'
     V100 = 0x100|ofp.OFPVID_PRESENT
     V200 = 0x200|ofp.OFPVID_PRESENT
+    V300 = 0x300|ofp.OFPVID_PRESENT
+    LOGNAME = 'faucet'
+    last_flows_to_dp = {}
+    valve = None
+    valves_manager = None
+    metrics = None
+    bgp = None
+    table = None
+    logger = None
+    tmpdir = None
+    faucet_event_sock = None
+    registry = None
+    sock = None
+    notifier = None
+    config_file = None
 
     def setup_valve(self, config):
         """Set up test DP with config."""
         self.tmpdir = tempfile.mkdtemp()
         self.config_file = os.path.join(self.tmpdir, 'valve_unit.yaml')
         self.faucet_event_sock = os.path.join(self.tmpdir, 'event.sock')
-        self.logfile = os.path.join(self.tmpdir, 'faucet.log')
         self.table = FakeOFTable(self.NUM_TABLES)
-        self.logger = valve_util.get_logger('faucet', self.logfile, logging.DEBUG, 0)
+        logfile = os.path.join(self.tmpdir, 'faucet.log')
+        self.logger = valve_util.get_logger(self.LOGNAME, logfile, logging.DEBUG, 0)
         self.registry = CollectorRegistry()
         # TODO: verify Prometheus variables
         self.metrics = faucet_metrics.FaucetMetrics(reg=self.registry) # pylint: disable=unexpected-keyword-arg
         # TODO: verify events
         self.notifier = faucet_experimental_event.FaucetExperimentalEventNotifier(
             self.faucet_event_sock, self.metrics, self.logger)
+        self.bgp = faucet_bgp.FaucetBgp(self.logger, self.metrics, self.send_flows_to_dp_by_id)
+        self.valves_manager = valves_manager.ValvesManager(
+            self.LOGNAME, self.logger, self.metrics, self.notifier, self.bgp, self.send_flows_to_dp_by_id)
         self.notifier.start()
-        dp = self.update_config(config, self.DP)
-        self.valve = valve_factory(dp)(dp, 'test_valve', self.notifier)
-        self.valve.update_config_metrics(self.metrics)
+        self.update_config(config)
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.connect(self.faucet_event_sock)
+        self.connect_dp()
 
-    def update_config(self, config, dp_name):
+    def teardown_valve(self):
+        """Tear down test DP."""
+        for handler in self.logger.handlers:
+            handler.close()
+        self.logger.handlers = []
+        self.sock.close()
+        shutil.rmtree(self.tmpdir)
+
+    def send_flows_to_dp_by_id(self, dp_id, flows):
+        """Callback for ValvesManager to simulate sending flows to DP."""
+        self.last_flows_to_dp[dp_id] = flows
+
+    def update_config(self, config):
         """Update FAUCET config with config as text."""
+        self.assertFalse(self.valves_manager.config_watcher.files_changed())
+        existing_config = os.path.exists(self.config_file)
         with open(self.config_file, 'w') as config_file:
             config_file.write(config)
-        _, dps = dp_parser(self.config_file, 'test_valve')
-        return [dp for dp in dps if dp.name == dp_name][0]
+        if existing_config:
+            self.assertTrue(self.valves_manager.config_watcher.files_changed())
+        self.last_flows_to_dp = {}
+        self.valves_manager.request_reload_configs(self.config_file)
+        self.valve = self.valves_manager.valves[self.DP_ID]
+        if self.DP_ID in self.last_flows_to_dp:
+            reload_ofmsgs = self.last_flows_to_dp[self.DP_ID]
+            self.table.apply_ofmsgs(reload_ofmsgs)
 
     def connect_dp(self):
         """Call DP connect and set all ports to up."""
-        self.assertTrue(self.valve.switch_features(None))
-        port_nos = range(1, self.NUM_PORTS + 1)
-        self.table.apply_ofmsgs(self.valve.datapath_connect(port_nos))
-        for port_no in port_nos:
-            self.set_port_up(port_no)
-
-    def apply_new_config(self, config):
-        """Update FAUCET config, and tell FAUCET config has changed."""
-        new_dp = self.update_config(config, self.DP)
-        _, ofmsgs = self.valve.reload_config(new_dp)
-        self.table.apply_ofmsgs(ofmsgs)
+        discovered_ports = []
+        for port_no in range(1, self.NUM_PORTS + 1):
+            ofpport = parser.OFPPort(
+                port_no=port_no,
+                hw_addr=None,
+                name=str(port_no),
+                config=0,
+                state=0,
+                curr=0,
+                advertised=0,
+                supported=0,
+                peer=0,
+                curr_speed=1e6,
+                max_speed=1e6)
+            discovered_ports.append(ofpport)
+        self.table.apply_ofmsgs(self.valve.datapath_connect(discovered_ports))
+        for port in discovered_ports:
+            self.set_port_up(port.port_no)
 
     def set_port_down(self, port_no):
         """Set port status of port to down."""
         self.table.apply_ofmsgs(self.valve.port_status_handler(
-            port_no, ofp.OFPPR_DELETE, None))
+            port_no, ofp.OFPPR_DELETE, 0))
 
     def set_port_up(self, port_no):
         """Set port status of port to up."""
         self.table.apply_ofmsgs(self.valve.port_status_handler(
-            port_no, ofp.OFPPR_ADD, None))
+            port_no, ofp.OFPPR_ADD, 1))
 
     def flap_port(self, port_no):
         """Flap op status on a port."""
         self.set_port_down(port_no)
         self.set_port_up(port_no)
 
-    def packet_outs_from_flows(self, flows):
+    @staticmethod
+    def packet_outs_from_flows(flows):
         """Return flows that are packetout actions."""
         return [flow for flow in flows if isinstance(flow, valve_of.parser.OFPPacketOut)]
-
-    def arp_for_controller(self):
-        """ARP request for controller VIP."""
-        arp_replies = self.rcv_packet(1, 0x100, {
-            'eth_src': self.P1_V100_MAC,
-            'eth_dst': mac.BROADCAST_STR,
-            'arp_source_ip': '10.0.0.1',
-            'arp_target_ip': '10.0.0.254'})
-        # TODO: check arp reply is valid
-        self.assertTrue(self.packet_outs_from_flows(arp_replies))
-
-    def nd_for_controller(self):
-        """IPv6 ND for controller VIP."""
-        dst_ip = ipaddress.IPv6Address('fc00::1:254')
-        nd_mac = valve_packet.ipv6_link_eth_mcast(dst_ip)
-        ip_gw_mcast = valve_packet.ipv6_solicited_node_from_ucast(dst_ip)
-        nd_replies = self.rcv_packet(2, 0x200, {
-            'eth_src': self.P2_V200_MAC,
-            'eth_dst': nd_mac,
-            'vid': 0x200,
-            'ipv6_src': 'fc00::1:1',
-            'ipv6_dst': str(ip_gw_mcast),
-            'neighbor_solicit_ip': str(dst_ip)})
-        # TODO: check ND reply is valid
-        self.assertTrue(self.packet_outs_from_flows(nd_replies))
-
-    def icmp_ping_controller(self):
-        """IPv4 ping controller VIP."""
-        echo_replies = self.rcv_packet(1, 0x100, {
-            'eth_src': self.P1_V100_MAC,
-            'eth_dst': self.FAUCET_MAC,
-            'vid': 0x100,
-            'ipv4_src': '10.0.0.1',
-            'ipv4_dst': '10.0.0.254',
-            'echo_request_data': bytes('A'*8, encoding='UTF-8')})
-        # TODO: check ping response
-        self.assertTrue(self.packet_outs_from_flows(echo_replies))
-
-    def icmp_ping_unknown_neighbor(self):
-        """IPv4 ping unknown host on same subnet, causing proactive learning."""
-        echo_replies = self.rcv_packet(1, 0x100, {
-            'eth_src': self.P1_V100_MAC,
-            'eth_dst': self.FAUCET_MAC,
-            'vid': 0x100,
-            'ipv4_src': '10.0.0.1',
-            'ipv4_dst': '10.0.0.99',
-            'echo_request_data': bytes('A'*8, encoding='UTF-8')})
-        # TODO: check proactive neighbor resolution
-        self.assertTrue(self.packet_outs_from_flows(echo_replies))
-
-    def icmpv6_ping_controller(self):
-        """IPv6 ping controller VIP."""
-        echo_replies = self.rcv_packet(2, 0x200, {
-            'eth_src': self.P2_V200_MAC,
-            'eth_dst': self.FAUCET_MAC,
-            'vid': 0x200,
-            'ipv6_src': 'fc00::1:1',
-            'ipv6_dst': 'fc00::1:254',
-            'echo_request_data': bytes('A'*8, encoding='UTF-8')})
-        # TODO: check ping response
-        self.assertTrue(self.packet_outs_from_flows(echo_replies))
 
     def learn_hosts(self):
         """Learn some hosts."""
@@ -364,35 +372,257 @@ vlans:
             'ipv4_dst': '10.0.0.4',
             'vid': 0x200})
 
-    def setUp(self):
-        self.setup_valve(self.CONFIG)
-        self.connect_dp()
-        self.learn_hosts()
+    def verify_flooding(self, matches):
+        """Verify flooding for a packet, depending on the DP implementation."""
+        for match in matches:
+            in_port = match['in_port']
+
+            if ('vlan_vid' in match and
+                    match['vlan_vid'] & ofp.OFPVID_PRESENT is not 0):
+                valve_vlan = self.valve.dp.vlans[match['vlan_vid'] & ~ofp.OFPVID_PRESENT]
+            else:
+                valve_vlan = self.valve.dp.get_native_vlan(in_port)
+
+            all_ports = set([port for port in self.valve.dp.ports.values() if port.running()])
+            remaining_ports = all_ports - set([port for port in valve_vlan.get_ports() if port.running])
+
+            # Packet must be flooded to all ports on the VLAN.
+            for port in valve_vlan.get_ports():
+                if valve_vlan.port_is_tagged(port):
+                    vid = valve_vlan.vid|ofp.OFPVID_PRESENT
+                else:
+                    vid = 0
+                if port.number == in_port:
+                    self.assertFalse(
+                        self.table.is_output(match, port=port.number, vid=vid),
+                        msg=('Packet %s with unknown eth_dst flooded back to input port'
+                             ' on VLAN %u to port %u' % (
+                                 match, valve_vlan.vid, port.number)))
+                else:
+                    self.assertTrue(
+                        self.table.is_output(match, port=port.number, vid=vid),
+                        msg=('Packet %s with unknown eth_dst not flooded'
+                             ' on VLAN %u to port %u' % (
+                                 match, valve_vlan.vid, port.number)))
+
+            # Packet must not be flooded to ports not on the VLAN.
+            for port in remaining_ports:
+                if port.stack:
+                    self.assertTrue(
+                        self.table.is_output(match, port=port.number),
+                        msg=('Packet with unknown eth_dst not flooded to stack port %s' % port))
+                else:
+                    self.assertFalse(
+                        self.table.is_output(match, port=port.number),
+                        msg=('Packet with unknown eth_dst flooded to non-VLAN %s' % port))
 
     def rcv_packet(self, port, vid, match):
-        pkt, eth_type = build_pkt(match)
-        eth_pkt = valve_packet.parse_eth_pkt(pkt)
-        pkt_meta = self.valve.parse_rcv_packet(
-            port, vid, eth_type, pkt.data, len(pkt.data), pkt, eth_pkt)
-        rcv_packet_ofmsgs = self.valve.rcv_packet(
-            other_valves=[], pkt_meta=pkt_meta)
-        rcv_packet_ofmsgs = valve_of.valve_flowreorder(
-            rcv_packet_ofmsgs)
+        """Simulate control plane receiving a packet on a port/VID."""
+        pkt = build_pkt(match)
+        vlan_pkt = pkt
+        # TODO: packet submitted to packet in always has VID
+        # Fake OF switch implementation should do this by applying actions.
+        if vid not in match:
+            vlan_match = match
+            vlan_match['vid'] = vid
+            vlan_pkt = build_pkt(match)
+        msg = namedtuple(
+            'null_msg',
+            ('match', 'in_port', 'data', 'total_len', 'cookie', 'reason'))
+        msg.reason = valve_of.ofp.OFPR_ACTION
+        msg.data = vlan_pkt.data
+        msg.total_len = len(msg.data)
+        msg.match = {'in_port': port}
+        msg.cookie = self.valve.dp.cookie
+        pkt_meta = self.valve.parse_pkt_meta(msg)
+        self.valves_manager.valve_packet_in(self.valve, pkt_meta) # pylint: disable=no-member
+        rcv_packet_ofmsgs = valve_of.valve_flowreorder(self.last_flows_to_dp[self.DP_ID])
         self.table.apply_ofmsgs(rcv_packet_ofmsgs)
         resolve_ofmsgs = self.valve.resolve_gateways()
         self.table.apply_ofmsgs(resolve_ofmsgs)
         self.valve.advertise()
         self.valve.state_expire()
-        self.valve.update_metrics(self.metrics)
+        self.valves_manager.update_metrics()
         return rcv_packet_ofmsgs
-
-    def tearDown(self):
-        self.sock.close()
-        shutil.rmtree(self.tmpdir)
 
 
 class ValveTestCase(ValveTestBase):
     """Test basic switching/L2/L3 functions."""
+
+    def setUp(self):
+        self.setup_valve(self.CONFIG)
+
+    def tearDown(self):
+        self.teardown_valve()
+
+    def test_disconnect(self):
+        """Test disconnection of DP from controller."""
+        # TODO: verify DP state change.
+        self.valve.datapath_disconnect()
+
+    def test_oferror(self):
+        """Test OFError handler."""
+        datapath = None
+        msg = valve_of.parser.OFPFlowMod(datapath=datapath)
+        msg.xid = 123
+        self.valve.recent_ofmsgs.append(msg)
+        test_error = valve_of.parser.OFPErrorMsg(datapath=datapath, msg=msg)
+        self.valve.oferror(test_error)
+
+    def test_switch_features(self):
+        """Test switch features handler."""
+        self.assertTrue(isinstance(self.valve, valve.TfmValve))
+        features_flows = self.valve.switch_features(None)
+        tfm_flows = [flow for flow in features_flows if isinstance(flow, valve_of.parser.OFPTableFeaturesStatsRequest)]
+        # TODO: verify TFM content.
+        self.assertTrue(tfm_flows)
+
+    def test_arp_for_controller(self):
+        """ARP request for controller VIP."""
+        arp_replies = self.rcv_packet(1, 0x100, {
+            'eth_src': self.P1_V100_MAC,
+            'eth_dst': mac.BROADCAST_STR,
+            'arp_source_ip': '10.0.0.1',
+            'arp_target_ip': '10.0.0.254'})
+        # TODO: check ARP reply is valid
+        self.assertTrue(self.packet_outs_from_flows(arp_replies))
+
+    def test_arp_reply_from_host(self):
+        """ARP reply for host."""
+        arp_replies = self.rcv_packet(1, 0x100, {
+            'eth_src': self.P1_V100_MAC,
+            'eth_dst': FAUCET_MAC,
+            'arp_source_ip': '10.0.0.1',
+            'arp_target_ip': '10.0.0.254'})
+        # TODO: check ARP reply is valid
+        self.assertTrue(arp_replies)
+        self.assertFalse(self.packet_outs_from_flows(arp_replies))
+
+    def test_nd_for_controller(self):
+        """IPv6 ND for controller VIP."""
+        dst_ip = ipaddress.IPv6Address('fc00::1:254')
+        nd_mac = valve_packet.ipv6_link_eth_mcast(dst_ip)
+        ip_gw_mcast = valve_packet.ipv6_solicited_node_from_ucast(dst_ip)
+        nd_replies = self.rcv_packet(2, 0x200, {
+            'eth_src': self.P2_V200_MAC,
+            'eth_dst': nd_mac,
+            'vid': 0x200,
+            'ipv6_src': 'fc00::1:1',
+            'ipv6_dst': str(ip_gw_mcast),
+            'neighbor_solicit_ip': str(dst_ip)})
+        # TODO: check ND reply is valid
+        self.assertTrue(self.packet_outs_from_flows(nd_replies))
+
+    def test_nd_from_host(self):
+        """IPv6 NA from host."""
+        na_replies = self.rcv_packet(2, 0x200, {
+            'eth_src': self.P2_V200_MAC,
+            'eth_dst': FAUCET_MAC,
+            'vid': 0x200,
+            'ipv6_src': 'fc00::1:1',
+            'ipv6_dst': 'fc00::1:254',
+            'neighbor_advert_ip': 'fc00::1:1'})
+        # TODO: check NA response flows are valid
+        self.assertTrue(na_replies)
+        self.assertFalse(self.packet_outs_from_flows(na_replies))
+
+    def test_ra_for_controller(self):
+        """IPv6 RA for controller."""
+        router_solicit_ip = 'ff02::2'
+        ra_replies = self.rcv_packet(2, 0x200, {
+            'eth_src': self.P2_V200_MAC,
+            'eth_dst': '33:33:00:00:00:02',
+            'vid': 0x200,
+            'ipv6_src': 'fe80::1:1',
+            'ipv6_dst': router_solicit_ip,
+            'router_solicit_ip': router_solicit_ip})
+        # TODO: check RA is valid
+        self.assertTrue(self.packet_outs_from_flows(ra_replies))
+
+    def test_icmp_ping_controller(self):
+        """IPv4 ping controller VIP."""
+        echo_replies = self.rcv_packet(1, 0x100, {
+            'eth_src': self.P1_V100_MAC,
+            'eth_dst': FAUCET_MAC,
+            'vid': 0x100,
+            'ipv4_src': '10.0.0.1',
+            'ipv4_dst': '10.0.0.254',
+            'echo_request_data': bytes('A'*8, encoding='UTF-8')})
+        # TODO: check ping response
+        self.assertTrue(self.packet_outs_from_flows(echo_replies))
+
+    def test_add_del_route(self):
+        """IPv4 add/del of a route."""
+        arp_replies = self.rcv_packet(1, 0x100, {
+            'eth_src': self.P1_V100_MAC,
+            'eth_dst': mac.BROADCAST_STR,
+            'arp_source_ip': '10.0.0.1',
+            'arp_target_ip': '10.0.0.254'})
+        # TODO: check arp reply is valid
+        self.assertTrue(self.packet_outs_from_flows(arp_replies))
+        valve_vlan = self.valve.dp.vlans[0x100]
+        ip_dst = ipaddress.IPv4Network('10.100.100.0/24')
+        ip_gw = ipaddress.IPv4Address('10.0.0.1')
+        route_add_replies = self.valve.add_route(
+            valve_vlan, ip_gw, ip_dst)
+        # TODO: check add flows.
+        self.assertTrue(route_add_replies)
+        route_del_replies = self.valve.del_route(
+            valve_vlan, ip_dst)
+        # TODO: check del flows.
+        self.assertTrue(route_del_replies)
+
+    def test_host_ipv4_fib_route(self):
+        """Test learning a FIB rule for an IPv4 host."""
+        fib_route_replies = self.rcv_packet(1, 0x100, {
+            'eth_src': self.P1_V100_MAC,
+            'eth_dst': self.UNKNOWN_MAC,
+            'vid': 0x100,
+            'ipv4_src': '10.0.0.2',
+            'ipv4_dst': '10.0.0.4',
+            'echo_request_data': bytes('A'*8, encoding='UTF-8')})
+        # TODO: verify learning rule contents
+        # We want to know this host was learned we did not get packet outs.
+        self.assertTrue(fib_route_replies)
+        self.assertFalse(self.packet_outs_from_flows(fib_route_replies))
+
+    def test_host_ipv6_fib_route(self):
+        """Test learning a FIB rule for an IPv6 host."""
+        fib_route_replies = self.rcv_packet(2, 0x200, {
+            'eth_src': self.P2_V200_MAC,
+            'eth_dst': self.UNKNOWN_MAC,
+            'vid': 0x200,
+            'ipv6_src': 'fc00::1:2',
+            'ipv6_dst': 'fc00::1:4',
+            'echo_request_data': bytes('A'*8, encoding='UTF-8')})
+        # TODO: verify learning rule contents
+        # We want to know this host was learned we did not get packet outs.
+        self.assertTrue(fib_route_replies)
+        self.assertFalse(self.packet_outs_from_flows(fib_route_replies))
+
+    def test_icmp_ping_unknown_neighbor(self):
+        """IPv4 ping unknown host on same subnet, causing proactive learning."""
+        echo_replies = self.rcv_packet(1, 0x100, {
+            'eth_src': self.P1_V100_MAC,
+            'eth_dst': FAUCET_MAC,
+            'vid': 0x100,
+            'ipv4_src': '10.0.0.1',
+            'ipv4_dst': '10.0.0.99',
+            'echo_request_data': bytes('A'*8, encoding='UTF-8')})
+        # TODO: check proactive neighbor resolution
+        self.assertTrue(self.packet_outs_from_flows(echo_replies))
+
+    def test_icmpv6_ping_controller(self):
+        """IPv6 ping controller VIP."""
+        echo_replies = self.rcv_packet(2, 0x200, {
+            'eth_src': self.P2_V200_MAC,
+            'eth_dst': FAUCET_MAC,
+            'vid': 0x200,
+            'ipv6_src': 'fc00::1:1',
+            'ipv6_dst': 'fc00::1:254',
+            'echo_request_data': bytes('A'*8, encoding='UTF-8')})
+        # TODO: check ping response
+        self.assertTrue(self.packet_outs_from_flows(echo_replies))
 
     def test_invalid_vlan(self):
         """Test that packets with incorrect vlan tagging get dropped."""
@@ -410,7 +640,7 @@ class ValveTestCase(ValveTestBase):
         """Test that packets from unknown macs are sent to controller.
 
         Untagged packets should have VLAN tags pushed before they are sent to
-        the controler.
+        the controller.
         """
         matches = [
             {'in_port': 1, 'vlan_vid': 0},
@@ -450,7 +680,9 @@ class ValveTestCase(ValveTestBase):
 
         They must be output to each port on the associated vlan, with the
         correct vlan tagging. And they must not be forwarded to a port not
-        on the associated vlan"""
+        on the associated vlan
+        """
+        self.learn_hosts()
         matches = [
             {
                 'in_port': 3,
@@ -469,42 +701,14 @@ class ValveTestCase(ValveTestBase):
             {
                 'in_port': 3,
                 'vlan_vid': self.V200,
-                'eth_dst': self.P1_V100_MAC
-            }]
-        dp = self.valve.dp
-        for match in matches:
-            in_port = match['in_port']
-
-            if 'vlan_vid' in match and\
-               match['vlan_vid'] & ofp.OFPVID_PRESENT is not 0:
-                valve_vlan = dp.vlans[match['vlan_vid'] & ~ofp.OFPVID_PRESENT]
-            else:
-                valve_vlan = self.valve.dp.get_native_vlan(in_port)
-
-            remaining_ports = set(range(1, 6))
-
-            # Check packets are output to each port on vlan
-            for port in valve_vlan.get_ports():
-                remaining_ports.discard(port.number)
-                if port.number != in_port and port.running():
-                    if valve_vlan.port_is_tagged(port):
-                        vid = valve_vlan.vid|ofp.OFPVID_PRESENT
-                    else:
-                        vid = 0
-                    self.assertTrue(
-                        self.table.is_output(match, port=port.number, vid=vid),
-                        msg=('Packet %s with unknown eth_dst not output '
-                             'correctly on VLAN %u to port %u' % (
-                                 match, valve_vlan.vid, port.number)))
-
-            # Check packets are not output to ports not on vlan
-            for port in remaining_ports:
-                self.assertFalse(
-                    self.table.is_output(match, port=port),
-                    msg=('Packet with unknown eth_dst output to non-VLAN port %u' % port))
+                'eth_src': self.P2_V200_MAC,
+            }
+        ]
+        self.verify_flooding(matches)
 
     def test_known_eth_src_rule(self):
         """Test that packets with known eth src addrs are not sent to controller."""
+        self.learn_hosts()
         matches = [
             {
                 'in_port': 1,
@@ -552,6 +756,7 @@ class ValveTestCase(ValveTestBase):
         """Test that packets with known eth dst addrs are output correctly.
 
         Output to the correct port with the correct vlan tagging."""
+        self.learn_hosts()
         match_results = [
             ({
                 'in_port': 2,
@@ -587,6 +792,7 @@ class ValveTestCase(ValveTestBase):
     def test_mac_learning_vlan_separation(self):
         """Test that when a mac is seen on a second vlan the original vlan
         rules are unaffected."""
+        self.learn_hosts()
         self.rcv_packet(2, 0x200, {
             'eth_src': self.P1_V100_MAC,
             'eth_dst': self.UNKNOWN_MAC,
@@ -679,6 +885,7 @@ class ValveTestCase(ValveTestBase):
             msg='Packet not output after port add')
 
     def test_port_acl_deny(self):
+        """Test that port ACL denies forwarding."""
         acl_config = """
 version: 2
 dps:
@@ -740,29 +947,35 @@ acls:
                 self.table.is_output(match, port=3, vid=self.V200),
                 msg='Packet not output before adding ACL')
 
-        self.apply_new_config(acl_config)
+        self.update_config(acl_config)
         self.assertFalse(
             self.table.is_output(drop_match),
-            msg='packet not blocked by acl')
+            msg='packet not blocked by ACL')
         self.assertTrue(
             self.table.is_output(accept_match, port=3, vid=self.V200),
-            msg='packet not allowed by acl')
-
-    def test_l3(self):
-        self.arp_for_controller()
-        self.nd_for_controller()
-        self.icmp_ping_controller()
-        self.icmp_ping_unknown_neighbor()
-        self.icmpv6_ping_controller()
+            msg='packet not allowed by ACL')
 
     def test_lldp_beacon(self):
+        """Test LLDP beacon service."""
+        # TODO: verify LLDP packet content.
         self.assertTrue(self.valve.send_lldp_beacons())
+
+    def test_unknown_port(self):
+        """Test port status change for unknown port handled."""
+        self.set_port_up(99)
 
 
 class ValveACLTestCase(ValveTestBase):
     """Test ACL drop/allow and reloading."""
 
+    def setUp(self):
+        self.setup_valve(self.CONFIG)
+
+    def tearDown(self):
+        self.teardown_valve()
+
     def test_vlan_acl_deny(self):
+        """Test VLAN ACL denies a packet."""
         acl_config = """
 dps:
     s1:
@@ -823,7 +1036,7 @@ acls:
                 self.table.is_output(match, port=3, vid=self.V200),
                 msg='Packet not output before adding ACL')
 
-        self.apply_new_config(acl_config)
+        self.update_config(acl_config)
         self.flap_port(2)
         self.assertFalse(
             self.table.is_output(drop_match),
@@ -870,73 +1083,34 @@ vlans:
 
     def setUp(self):
         self.setup_valve(self.OLD_CONFIG)
-        self.connect_dp()
         self.flap_port(1)
-        self.learn_hosts()
+        self.update_config(self.CONFIG)
 
-        self.apply_new_config(self.CONFIG)
-        self.learn_hosts()
+    def tearDown(self):
+        self.teardown_valve()
 
 
-class ValveTFMTestCase(ValveTestCase):
-    """Test vendors that require TFM-based pipeline programming."""
-    # TODO: check TFM messages are correct
+class ValveStackTestCase(ValveTestBase):
+    """Test stacking/forwarding."""
 
-    CONFIG = """
-dps:
-    s1:
-        ignore_learn_ins: 0
-        hardware: 'GenericTFM'
-        dp_id: 1
-        pipeline_config_dir: '%s/../etc/ryu/faucet'
-        lldp_beacon:
-            send_interval: 1
-            max_per_interval: 1
-        interfaces:
-            p1:
-                number: 1
-                native_vlan: v100
-                lldp_beacon:
-                    enable: True
-                    system_name: "faucet"
-                    port_descr: "first_port"
-            p2:
-                number: 2
-                native_vlan: v200
-                tagged_vlans: [v100]
-            p3:
-                number: 3
-                tagged_vlans: [v100, v200]
-            p4:
-                number: 4
-                tagged_vlans: [v200]
-            p5:
-                number: 5
-                tagged_vlans: [v300]
-vlans:
-    v100:
-        vid: 0x100
-        faucet_vips: ['10.0.0.254/24']
-        routes:
-            - route:
-                ip_dst: 10.99.99.0/24
-                ip_gw: 10.0.0.1
-            - route:
-                ip_dst: 10.99.98.0/24
-                ip_gw: 10.0.0.99
-    v200:
-        vid: 0x200
-        faucet_vips: ['fc00::1:254/112', 'fe80::1:254/64']
-        routes:
-            - route:
-                ip_dst: 'fc00::10:0/112'
-                ip_gw: 'fc00::1:1'
-            - route:
-                ip_dst: 'fc00::20:0/112'
-                ip_gw: 'fc00::1:99'
-    v300:
-        vid: 0x300
-""" % os.path.dirname(os.path.realpath(__file__))
+    DP = 's3'
+    DP_ID = 0x3
+
+    def setUp(self):
+        self.setup_valve(self.CONFIG)
+
+    def tearDown(self):
+        self.teardown_valve()
+
+    def test_stack_flood(self):
+        """Test packet flooding when stacking."""
+        matches = [
+            {
+                'in_port': 1,
+                'vlan_vid': 0,
+                'eth_src': self.P1_V100_MAC
+            }]
+        self.verify_flooding(matches)
 
 
 class ValveMirrorTestCase(ValveTestCase):
@@ -959,6 +1133,8 @@ dps:
     s1:
         ignore_learn_ins: 0
         dp_id: 1
+        hardware: 'GenericTFM'
+        pipeline_config_dir: '%s/../etc/ryu/faucet'
         lldp_beacon:
             send_interval: 1
             max_per_interval: 1
@@ -1006,21 +1182,8 @@ vlans:
             - route:
                 ip_dst: 'fc00::20:0/112'
                 ip_gw: 'fc00::1:99'
-"""
+""" % os.path.dirname(os.path.realpath(__file__))
 
-
-class ValveStackTestCase(ValveTestBase):
-    """Test stacking/forwarding."""
-
-    DP = 's3'
-    DP_ID = 0x3
-
-    def learn_hosts(self):
-         return
-
-    def test_stack(self):
-         # TODO: need to test distributed switching actually.
-         return
 
 
 if __name__ == "__main__":

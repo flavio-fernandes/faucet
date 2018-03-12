@@ -36,9 +36,12 @@ class ValveFloodManager(object):
         (False, valve_of.mac.BROADCAST_STR, None), # flood on ethernet broadcasts
     )
 
-    def __init__(self, flood_table, flood_priority,
+    def __init__(self, flood_table, eth_src_table,
+                 flood_priority, bypass_priority,
                  use_group_table, groups):
         self.flood_table = flood_table
+        self.eth_src_table = eth_src_table
+        self.bypass_priority = bypass_priority
         self.flood_priority = flood_priority
         self.use_group_table = use_group_table
         self.groups = groups
@@ -99,7 +102,7 @@ class ValveFloodManager(object):
         ofmsgs = []
         mirrored_ports = vlan.mirrored_ports()
         for port in mirrored_ports:
-            mirror_acts = [valve_of.output_port(port.mirror)]
+            mirror_acts = port.mirror_actions()
             ofmsgs.extend(self._build_flood_rule_for_port(
                 vlan, eth_dst, eth_dst_mask,
                 exclude_unicast, command, flood_priority,
@@ -195,12 +198,14 @@ class ValveFloodManager(object):
 class ValveFloodStackManager(ValveFloodManager):
     """Implement dataplane based flooding for stacked dataplanes."""
 
-    def __init__(self, flood_table, flood_priority,
-                 use_group_table, groups,
-                 stack, stack_ports,
+    def __init__(self, flood_table, eth_src_table,
+                 flood_priority, bypass_priority,
+                 use_group_table, groups, stack, stack_ports,
                  dp_shortest_path_to_root, shortest_path_port):
         super(ValveFloodStackManager, self).__init__(
-            flood_table, flood_priority, use_group_table, groups)
+            flood_table, eth_src_table,
+            flood_priority, bypass_priority,
+            use_group_table, groups)
         self.stack = stack
         self.stack_ports = stack_ports
         my_root_distance = len(dp_shortest_path_to_root())
@@ -294,7 +299,24 @@ class ValveFloodStackManager(ValveFloodManager):
         if modify:
             command = valve_of.ofp.OFPFC_MODIFY_STRICT
         # TODO: group tables for stacking
-        return self._build_multiout_flood_rules(vlan, command)
+        ofmsgs = self._build_multiout_flood_rules(vlan, command)
+        # Because stacking uses reflected broadcasts from the root,
+        # don't try to learn broadcast sources from stacking ports.
+        for unicast_eth_dst, eth_dst, eth_dst_mask in self.FLOOD_DSTS:
+            if unicast_eth_dst:
+                continue
+            for port in self.stack_ports:
+                match = self.eth_src_table.match(
+                    in_port=port.number,
+                    vlan=vlan,
+                    eth_dst=eth_dst,
+                    eth_dst_mask=eth_dst_mask)
+                ofmsgs.append(self.eth_src_table.flowmod(
+                    match=match,
+                    command=command,
+                    inst=[valve_of.goto_table(self.flood_table)],
+                    priority=self.bypass_priority))
+        return ofmsgs
 
     def _vlan_all_ports(self, vlan, exclude_unicast):
         vlan_all_ports = super(ValveFloodStackManager, self)._vlan_all_ports(
@@ -340,12 +362,13 @@ class ValveFloodStackManager(ValveFloodManager):
         # shortest path via alternate DP).
         eth_src = pkt_meta.eth_src
         vlan_vid = pkt_meta.vlan.vid
-        for other_valve in other_valves:
+        stacked_valves = [valve for valve in other_valves if valve.dp.stack is not None]
+        for other_valve in stacked_valves:
             if vlan_vid in other_valve.dp.vlans:
-                other_dp_host_cache = other_valve.dp.vlans[vlan_vid].dyn_host_cache
-                if eth_src in other_dp_host_cache:
-                    host = other_dp_host_cache[eth_src]
-                    if host.port.stack is None:
+                other_dp_vlan = other_valve.dp.vlans[vlan_vid]
+                entry = other_dp_vlan.cached_host(eth_src)
+                if entry is not None:
+                    if entry.port.stack is None:
                         return other_valve.dp
         return None
 

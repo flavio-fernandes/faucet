@@ -3,12 +3,13 @@
 """Test config parsing"""
 
 import logging
+import re
 import shutil
 import tempfile
-import unittest
 import os
+import unittest
+
 from faucet import config_parser as cp
-import re
 
 LOGNAME = '/dev/null'
 
@@ -542,6 +543,24 @@ acls:
 """
         self.check_config_failure(config, cp.dp_parser)
 
+    def test_resolved_mirror_port(self):
+        """Test can use name reference to mirrored port."""
+        config = """
+vlans:
+    office:
+        vid: 100
+dps:
+    sw1:
+        dp_id: 0x1
+        interfaces:
+            mirrored_port:
+                number: 1
+                native_vlan: office
+            2:
+                mirror: mirrored_port
+"""
+        self.check_config_success(config, cp.dp_parser)
+
     def test_vlans_on_mirror_ports(self):
         config = """
 vlans:
@@ -789,6 +808,33 @@ vlans:
         vid: 100
         acl_in: office-vlan-protect
         acls_in: [access-port-protect]
+dps:
+    sw1:
+        dp_id: 0x1
+        interfaces:
+            1:
+                native_vlan: office
+"""
+        self.check_config_failure(config, cp.dp_parser)
+
+    def test_inconsistent_acl_exact_match(self):
+        """Test that ACLs have consistent exact_match."""
+        config = """
+acls:
+    acl_a:
+        exact_match: False
+        rules:
+            - rule:
+                udp_src: 80
+    acl_b:
+        exact_match: True
+        rules:
+            - rule:
+                udp_src: 81
+vlans:
+    office:
+        vid: 100
+        acls_in: [acl_a, acl_b]
 dps:
     sw1:
         dp_id: 0x1
@@ -1504,6 +1550,37 @@ dps:
 """
         self.check_config_failure(config, cp.dp_parser)
 
+    def test_multi_bgp(self):
+        """Test multiple BGP VLANs can be configured."""
+        config = """
+vlans:
+    routing1:
+        vid: 100
+        faucet_vips: ["10.0.0.254/24"]
+        bgp_server_addresses: ["127.0.0.1"]
+        bgp_as: 100
+        bgp_routerid: "1.1.1.1"
+        bgp_neighbor_addresses: ["127.0.0.1"]
+        bgp_neighbor_as: 100
+    routing2:
+        vid: 200
+        faucet_vips: ["10.0.0.253/24"]
+        bgp_server_addresses: ["127.0.0.1"]
+        bgp_as: 200
+        bgp_routerid: "1.1.1.1"
+        bgp_neighbor_addresses: ["127.0.0.2"]
+        bgp_neighbor_as: 200
+dps:
+    sw1:
+        dp_id: 0x1
+        interfaces:
+            1:
+                native_vlan: routing1
+            2:
+                native_vlan: routing2
+"""
+        self.check_config_success(config, cp.dp_parser)
+
     def test_unknown_vlan_key(self):
         """Test unknown VLAN key."""
         config = """
@@ -1658,6 +1735,39 @@ dps:
                     port_descr: port_description
                     org_tlvs:
                         - {oui: 0x12bb, subtype: 2, info: "01406500"}
+"""
+        self.check_config_success(config, cp.dp_parser)
+
+    def test_multi_acl_dp(self):
+        """Test multiple ACLs with multiple DPs, where one ACL does mirroring."""
+        config = """
+dps:
+  SWPRI2:
+    dp_id: 0x223d5a07ff
+    interfaces:
+      11:
+        acl_in: non_mirroring_acl
+        native_vlan: 197
+  SWSEC0B:
+    dp_id: 0xe01aea107a69
+    interfaces:
+      30:
+        native_vlan: 197
+        acl_in: mirroring_acl
+      47:
+        native_vlan: 197
+vlans:
+  197:
+acls:
+  mirroring_acl:
+  - rule:
+      actions:
+        allow: 1
+        mirror: 47
+  non_mirroring_acl:
+  - rule:
+      actions:
+        allow: 1
 """
         self.check_config_success(config, cp.dp_parser)
 

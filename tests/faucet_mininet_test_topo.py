@@ -92,7 +92,7 @@ class FaucetHost(FaucetHostCleanup, CPULimitedHost):
 
 
 class FaucetSwitch(FaucetHostCleanup, OVSSwitch):
-    """Switch that will be used by all tests (kernel based OVS)."""
+    """Switch that will be used by all tests (netdev based OVS)."""
 
     controller_params = {
         'controller_burst_limit': 25,
@@ -101,20 +101,17 @@ class FaucetSwitch(FaucetHostCleanup, OVSSwitch):
 
     def __init__(self, name, **params):
         super(FaucetSwitch, self).__init__(
-            name=name, datapath='kernel', reconnectms=8000, **params)
+            name=name, reconnectms=8000, **params)
 
     def start(self, controllers):
         # Transcluded from Mininet source, since need to insert
         # controller parameters at switch creation time.
-        if self.inNamespace:
-            raise Exception(
-                'OVS kernel switch does not work in a namespace')
         int(self.dpid, 16)  # DPID must be a hex string
+        switch_intfs = [intf for intf in self.intfList() if self.ports[intf] and not intf.IP()]
         # Command to add interfaces
-        intfs = ''.join(' -- add-port %s %s' % (self, intf) +
-                        self.intfOpts(intf)
-                        for intf in self.intfList()
-                        if self.ports[intf] and not intf.IP())
+        intfs = ' '.join(' -- add-port %s %s' % (self, intf) +
+                         self.intfOpts(intf)
+                         for intf in switch_intfs)
         # Command to create controller entries
         clist = [(self.name + c.name, '%s:%s:%d' %
                  (c.protocol, c.IP(), c.port))
@@ -140,6 +137,11 @@ class FaucetSwitch(FaucetHostCleanup, OVSSwitch):
                    ' -- set bridge %s controller=[%s]' % (self, cids) +
                    self.bridgeOpts() +
                    intfs )
+        # switch interfaces on mininet host, must have no IP config.
+        for intf in switch_intfs:
+            for ipv in (4, 6):
+                self.cmd('ip -%u addr flush dev %s' % (ipv, intf))
+            assert '' == self.cmd('echo 1 > /proc/sys/net/ipv6/conf/%s/disable_ipv6' % intf)
         # If necessary, restore TC config overwritten by OVS
         if not self.batch:
             for intf in self.intfList():
@@ -198,12 +200,13 @@ class FaucetSwitchTopo(Topo):
         host_name = 'u%s%1.1u' % (sid_prefix, host_n + 1)
         return self.addHost(name=host_name, cls=FaucetHost, cpu=self.CPUF)
 
-    def _add_faucet_switch(self, sid_prefix, dpid):
+    def _add_faucet_switch(self, sid_prefix, dpid, ovs_type):
         """Add a FAUCET switch."""
         switch_name = 's%s' % sid_prefix
         return self.addSwitch(
             name=switch_name,
             cls=FaucetSwitch,
+            datapath=ovs_type,
             dpid=faucet_mininet_test_util.mininet_dpid(dpid))
 
     def _add_links(self, switch, hosts, links_per_host):
@@ -211,7 +214,7 @@ class FaucetSwitchTopo(Topo):
             for _ in range(links_per_host):
                 self.addLink(host, switch, delay=self.DELAY, use_htb=True)
 
-    def build(self, ports_sock, test_name, dpids,
+    def build(self, ovs_type, ports_sock, test_name, dpids,
               n_tagged=0, tagged_vid=100, n_untagged=0, links_per_host=0):
         for dpid in dpids:
             serialno = faucet_mininet_test_util.get_serialno(
@@ -221,14 +224,14 @@ class FaucetSwitchTopo(Topo):
                 self._add_tagged_host(sid_prefix, tagged_vid, host_n)
             for host_n in range(n_untagged):
                 self._add_untagged_host(sid_prefix, host_n)
-            switch = self._add_faucet_switch(sid_prefix, dpid)
+            switch = self._add_faucet_switch(sid_prefix, dpid, ovs_type)
             self._add_links(switch, self.hosts(), links_per_host)
 
 
 class FaucetHwSwitchTopo(FaucetSwitchTopo):
     """FAUCET switch topology that contains a hardware switch."""
 
-    def build(self, ports_sock, test_name, dpids,
+    def build(self, ovs_type, ports_sock, test_name, dpids,
               n_tagged=0, tagged_vid=100, n_untagged=0, links_per_host=0):
         for dpid in dpids:
             serialno = faucet_mininet_test_util.get_serialno(
@@ -242,7 +245,7 @@ class FaucetHwSwitchTopo(FaucetSwitchTopo):
             output('bridging hardware switch DPID %s (%x) dataplane via OVS DPID %s (%x)' % (
                 dpid, int(dpid), remap_dpid, int(remap_dpid)))
             dpid = remap_dpid
-            switch = self._add_faucet_switch(sid_prefix, dpid)
+            switch = self._add_faucet_switch(sid_prefix, dpid, ovs_type)
             self._add_links(switch, self.hosts(), links_per_host)
 
 
@@ -251,7 +254,8 @@ class FaucetStringOfDPSwitchTopo(FaucetSwitchTopo):
 
     switch_to_switch_links = 1
 
-    def build(self, ports_sock, test_name, dpids, n_tagged=0, tagged_vid=100, n_untagged=0,
+    def build(self, ovs_type, ports_sock, test_name, dpids,
+              n_tagged=0, tagged_vid=100, n_untagged=0,
               links_per_host=0, switch_to_switch_links=1):
         """
 
@@ -289,7 +293,7 @@ class FaucetStringOfDPSwitchTopo(FaucetSwitchTopo):
                 hosts.append(self._add_tagged_host(sid_prefix, tagged_vid, host_n))
             for host_n in range(n_untagged):
                 hosts.append(self._add_untagged_host(sid_prefix, host_n))
-            switch = self._add_faucet_switch(sid_prefix, dpid)
+            switch = self._add_faucet_switch(sid_prefix, dpid, ovs_type)
             self._add_links(switch, hosts, links_per_host)
             if last_switch is not None:
                 # Add a switch-to-switch link with the previous switch,
@@ -309,7 +313,7 @@ class BaseFAUCET(Controller):
     pid_file = None
     tmpdir = None
     ofcap = None
-    MAX_OF_PKTS = 500
+    MAX_OF_PKTS = 5000
     MAX_CTL_TIME = 300
 
     BASE_CARGS = ' '.join((
@@ -319,7 +323,7 @@ class BaseFAUCET(Controller):
 
     RYU_CONF = """
 [DEFAULT]
-echo_request_interval=3
+echo_request_interval=10
 maximum_unreplied_echo_requests=5
 socket_timeout=15
 """
@@ -395,10 +399,17 @@ socket_timeout=15
         cprofile_args = ''
         if self.CPROFILE:
             cprofile_args = 'python3 -m cProfile -s time'
+        full_faucet_dir = os.path.abspath(faucet_mininet_test_util.FAUCET_DIR)
         with open(script_wrapper_name, 'w') as script_wrapper:
-            script_wrapper.write(
-                'PYTHONPATH=.:..:../faucet %s exec timeout %u %s /usr/local/bin/faucet %s $*\n' % (
-                    ' '.join(env_vars), self.MAX_CTL_TIME, cprofile_args, args))
+            faucet_cli = (
+                'PYTHONPATH=%s %s exec timeout %u %s %s %s $*\n' % (
+                    os.path.dirname(full_faucet_dir),
+                    ' '.join(env_vars),
+                    self.MAX_CTL_TIME,
+                    os.path.join(full_faucet_dir, '__main__.py'),
+                    cprofile_args,
+                    args))
+            script_wrapper.write(faucet_cli)
         return '/bin/sh %s' % script_wrapper_name
 
     def ryu_pid(self):
