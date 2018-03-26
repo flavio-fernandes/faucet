@@ -1117,17 +1117,28 @@ dbs:
         conf['vlans'][vlan][config_name] = config_value
         self.reload_conf(conf, self.faucet_config_path, restart, cold_start)
 
+    def ipv4_vip_bcast(self):
+        return self.FAUCET_VIPV4.network.broadcast_address
+
     def verify_broadcast(self):
         first_host = self.net.hosts[0]
         last_host = self.net.hosts[-1]
-        ip_bcast = str(self.FAUCET_VIPV4.network.broadcast_address)
         tcpdump_filter = (
-            'ether dst host ff:ff:ff:ff:ff:ff and icmp and host %s' % ip_bcast)
+            'ether dst host ff:ff:ff:ff:ff:ff and icmp and host %s' % self.ipv4_vip_bcast())
         tcpdump_txt = self.tcpdump_helper(
             last_host, tcpdump_filter, [
-                lambda: first_host.cmd('ping -b -c3 %s' % ip_bcast)])
+                lambda: first_host.cmd('ping -b -c3 %s' % self.ipv4_vip_bcast())])
         self.assertTrue(re.search(
-            '%s: ICMP echo request' % ip_bcast, tcpdump_txt))
+            '%s: ICMP echo request' % self.ipv4_vip_bcast(), tcpdump_txt))
+
+    def verify_no_bcast_to_self(self, host, timeout=5):
+        tcpdump_filter = '-Q in ether src %s' % host.MAC()
+        tcpdump_txt = self.tcpdump_helper(
+            host, tcpdump_filter, [
+                lambda: host.cmd('ping -b -c3 %s' % self.ipv4_vip_bcast())],
+            timeout=timeout, vflags='-vv', packets=1)
+        self.assertTrue(
+            re.search('0 packets captured', tcpdump_txt), msg=tcpdump_txt)
 
     def verify_controller_fping(self, host, faucet_vip,
                                 total_packets=100, packet_interval_ms=100):
@@ -1309,14 +1320,15 @@ dbs:
                 re.search('0 packets captured', tcpdump_txt), msg=tcpdump_txt)
 
     def verify_ping_mirrored(self, first_host, second_host, mirror_host):
+        """Verify that unicast traffic to and from a mirrored port is mirrored."""
         self.net.ping((first_host, second_host))
         for host in (first_host, second_host):
             self.require_host_learned(host)
         self.retry_net_ping(hosts=(first_host, second_host))
-        mirror_mac = mirror_host.MAC()
         tcpdump_filter = (
-            'not ether src %s and '
-            '(icmp[icmptype] == 8 or icmp[icmptype] == 0)') % mirror_mac
+            '(ether src %s or ether src %s) and '
+            '(icmp[icmptype] == 8 or icmp[icmptype] == 0)') % (
+                first_host.MAC(), second_host.MAC())
         first_ping_second = 'ping -c1 %s' % second_host.IP()
         tcpdump_txt = self.tcpdump_helper(
             mirror_host, tcpdump_filter, [
@@ -1326,6 +1338,23 @@ dbs:
                         msg=tcpdump_txt)
         self.assertTrue(re.search(
             '%s: ICMP echo reply' % first_host.IP(), tcpdump_txt),
+                        msg=tcpdump_txt)
+
+    def verify_bcast_ping_mirrored(self, first_host, second_host, mirror_host):
+        """Verify that broadcast to a mirrored port, is mirrored."""
+        self.net.ping((first_host, second_host))
+        for host in (first_host, second_host):
+            self.require_host_learned(host)
+        self.retry_net_ping(hosts=(first_host, second_host))
+        tcpdump_filter = (
+            'ether src %s and ether dst ff:ff:ff:ff:ff:ff and '
+            'icmp[icmptype] == 8') % second_host.MAC()
+        second_ping_bcast = 'ping -c1 -b %s' % self.ipv4_vip_bcast()
+        tcpdump_txt = self.tcpdump_helper(
+            mirror_host, tcpdump_filter, [
+                lambda: second_host.cmd(second_ping_bcast)])
+        self.assertTrue(re.search(
+            '%s: ICMP echo request' % self.ipv4_vip_bcast(), tcpdump_txt),
                         msg=tcpdump_txt)
 
     def verify_ping_mirrored_multi(self, ping_pairs, mirror_host):
@@ -1421,23 +1450,6 @@ dbs:
              lambda: second_host.cmd(curl_first_host),
              lambda: self.net.ping(hosts=(second_host, third_host))])
         return not re.search('0 packets captured', tcpdump_txt)
-
-    def verify_port1_unicast(self, unicast_status):
-        # Unicast flooding rule for from port 1
-        self.assertEqual(
-            self.matching_flow_present(
-                {u'dl_vlan': u'100', u'in_port': int(self.port_map['port_1'])},
-                table_id=self.FLOOD_TABLE,
-                match_exact=True),
-            unicast_status)
-        #  Unicast flood rule exists that output to port 1
-        self.assertEqual(
-            self.matching_flow_present(
-                {u'dl_vlan': u'100', u'in_port': int(self.port_map['port_2'])},
-                table_id=self.FLOOD_TABLE,
-                actions=[u'OUTPUT:%u' % self.port_map['port_1']],
-                match_exact=True),
-            unicast_status)
 
     def verify_lldp_blocked(self):
         first_host, second_host = self.net.hosts[0:2]
@@ -1781,7 +1793,7 @@ dbs:
                 second_host, tcpdump_filter, [
                     lambda: first_host.cmd(
                         'date | socat - udp-datagram:%s:%d,broadcast' % (
-                        target_addr, port))],
+                            target_addr, port))],
                 packets=1)
             if re.search(success_re, tcpdump_txt):
                 return True

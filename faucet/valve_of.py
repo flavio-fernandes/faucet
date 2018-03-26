@@ -58,6 +58,17 @@ def port_status_from_state(state):
     return not (state & ofp.OFPPS_LINK_DOWN)
 
 
+def is_table_features_req(ofmsg):
+    """Return True if flow message is a TFM req.
+
+    Args:
+        ofmsg: ryu.ofproto.ofproto_v1_3_parser message.
+    Returns:
+        bool: True if is a TFM req.
+    """
+    return isinstance(ofmsg, parser.OFPTableFeaturesStatsRequest)
+
+
 def is_flowmod(ofmsg):
     """Return True if flow message is a FlowMod.
 
@@ -406,13 +417,13 @@ def match_from_dict(match_dict):
             del match_dict[old_match]
 
     kwargs = {}
-    for match, field in list(match_dict.items()):
-        assert match in MATCH_FIELDS, 'Unknown match field: %s' % match
+    for of_match, field in list(match_dict.items()):
+        assert of_match in MATCH_FIELDS, 'Unknown match field: %s' % of_match
         try:
-            encoded_field = MATCH_FIELDS[match](field)
+            encoded_field = MATCH_FIELDS[of_match](field)
         except TypeError:
-            assert False, '%s cannot be type %s' % (match, type(field))
-        kwargs[match] = encoded_field
+            assert False, '%s cannot be type %s' % (of_match, type(field))
+        kwargs[of_match] = encoded_field
 
     return parser.OFPMatch(**kwargs)
 
@@ -591,7 +602,23 @@ def is_delflow(ofmsg):
     return is_flowdel(ofmsg) or is_groupdel(ofmsg) or is_meterdel(ofmsg)
 
 
-def valve_flowreorder(input_ofmsgs):
+def dedupe_ofmsgs(input_ofmsgs):
+    """Return deduplicated ofmsg list."""
+    # Built in comparison doesn't work until serialized() called
+    deduped_input_ofmsgs = set()
+    if input_ofmsgs:
+        input_ofmsgs_hashes = set()
+        for ofmsg in input_ofmsgs:
+            # Can't use dict or json comparison as may be nested
+            ofmsg_str = str(ofmsg)
+            if ofmsg_str in input_ofmsgs_hashes:
+                continue
+            deduped_input_ofmsgs.add(ofmsg)
+            input_ofmsgs_hashes.add(ofmsg_str)
+    return deduped_input_ofmsgs
+
+
+def valve_flowreorder(input_ofmsgs, use_barriers=True):
     """Reorder flows for better OFA performance."""
     # Move all deletes to be first, and add one barrier,
     # while preserving order. Platforms that do parallel delete
@@ -599,18 +626,21 @@ def valve_flowreorder(input_ofmsgs):
     # at most only one barrier to deal with.
     # TODO: further optimizations may be possible - for example,
     # reorder adds to be in priority order.
-    delete_ofmsgs = [ofmsg for ofmsg in input_ofmsgs if is_delflow(ofmsg)]
+    delete_ofmsgs = dedupe_ofmsgs([ofmsg for ofmsg in input_ofmsgs if is_delflow(ofmsg)])
     if not delete_ofmsgs:
         return input_ofmsgs
-    nondelete_ofmsgs = set(input_ofmsgs) - set(delete_ofmsgs)
+    input_ofmsgs = dedupe_ofmsgs(input_ofmsgs)
+    nondelete_ofmsgs = input_ofmsgs - delete_ofmsgs
     groupadd_ofmsgs = set([ofmsg for ofmsg in nondelete_ofmsgs if is_groupadd(ofmsg)])
     meteradd_ofmsgs = set([ofmsg for ofmsg in nondelete_ofmsgs if is_meteradd(ofmsg)])
+    tfm_ofmsgs =  set([ofmsg for ofmsg in nondelete_ofmsgs if is_table_features_req(ofmsg)])
     other_ofmsgs = nondelete_ofmsgs - groupadd_ofmsgs.union(meteradd_ofmsgs)
     output_ofmsgs = []
-    for ofmsgs in (delete_ofmsgs, groupadd_ofmsgs, meteradd_ofmsgs):
+    for ofmsgs in (delete_ofmsgs, tfm_ofmsgs, groupadd_ofmsgs, meteradd_ofmsgs):
         if ofmsgs:
-            output_ofmsgs.extend([ofmsg for ofmsg in ofmsgs])
-            output_ofmsgs.append(barrier())
+            output_ofmsgs.extend(list(ofmsgs))
+            if use_barriers:
+                output_ofmsgs.append(barrier())
     output_ofmsgs.extend(other_ofmsgs)
     return output_ofmsgs
 
@@ -626,12 +656,12 @@ def group_flood_buckets(ports, untagged):
     return buckets
 
 
-def flood_tagged_port_outputs(ports, in_port, exclude_ports=None):
+def flood_tagged_port_outputs(ports, in_port=None, exclude_ports=None):
     """Return list of actions necessary to flood to list of tagged ports."""
     flood_acts = []
     if ports:
         for port in ports:
-            if port == in_port:
+            if in_port is not None and port == in_port:
                 if port.hairpin:
                     flood_acts.append(output_in_port())
                 continue
@@ -641,13 +671,13 @@ def flood_tagged_port_outputs(ports, in_port, exclude_ports=None):
     return flood_acts
 
 
-def flood_untagged_port_outputs(ports, in_port, exclude_ports=None):
+def flood_untagged_port_outputs(ports, in_port=None, exclude_ports=None):
     """Return list of actions necessary to flood to list of untagged ports."""
     flood_acts = []
     if ports:
         flood_acts.append(pop_vlan())
         flood_acts.extend(flood_tagged_port_outputs(
-            ports, in_port, exclude_ports=exclude_ports))
+            ports, in_port=in_port, exclude_ports=exclude_ports))
     return flood_acts
 
 

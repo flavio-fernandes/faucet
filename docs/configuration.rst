@@ -4,12 +4,12 @@ Configuration
 Faucet is configured with a YAML-based configuration file, ``faucet.yaml``.
 The following is example demonstrating a few common features:
 
-.. literalinclude:: ../etc/ryu/faucet/faucet.yaml
+.. literalinclude:: ../etc/faucet/faucet.yaml
   :language: yaml
   :caption: faucet.yaml
   :name: faucet.yaml
 
-.. literalinclude:: ../etc/ryu/faucet/acls.yaml
+.. literalinclude:: ../etc/faucet/acls.yaml
   :language: yaml
   :caption: acls.yaml
   :name: acls.yaml
@@ -21,7 +21,7 @@ A port not explicitly defined in the YAML configuration file will be left down a
 Gauge is configured similarly with, ``gauge.yaml``.
 The following is example demonstrating a few common features:
 
-.. literalinclude:: ../etc/ryu/faucet/gauge.yaml
+.. literalinclude:: ../etc/faucet/gauge.yaml
   :language: yaml
   :caption: gauge.yaml
   :name: gauge.yaml
@@ -33,7 +33,7 @@ You can verify that your configuration is correct with the ``check_faucet_config
 
 .. code:: console
 
-  check_faucet_config /etc/ryu/faucet/faucet.yaml
+  check_faucet_config /etc/faucet/faucet.yaml
 
 Configuration examples
 ----------------------
@@ -64,8 +64,8 @@ Files are parsed in order, and both absolute and relative (to the configuration 
 .. code:: yaml
 
   include:
-      - /etc/ryu/faucet/dps.yaml
-      - /etc/ryu/faucet/vlans.yaml
+      - /etc/faucet/dps.yaml
+      - /etc/faucet/vlans.yaml
 
   include-optional:
       - acls.yaml
@@ -169,10 +169,7 @@ string names given to the datapath, or the OFP datapath id.
     * - drop_lldp
       - boolean
       - True
-      - If True, Faucet will drop all STP BPDUs arriving at the datapath. NB:
-        Faucet does not handle BPDUs itself, if you disable this then you
-        either need to configure an ACL to catch BDPUs or Faucet will forward
-        them as though they were normal traffic.
+      - If True, Faucet will drop all LLDP packets arriving at the datapath.
     * - drop_spoofed_faucet_mac
       - bool
       - True
@@ -643,3 +640,79 @@ Failover is an experimental option, but can be configured as follows:
       - None
       - The list of ports the packet can be output through.
 
+.. _env-vars:
+
+Environment variables
+---------------------
+
+You can use environment variables to override default behaviour of faucet
+such as paths for configuration files and port numbers.
+
+.. list-table::
+    :widths: 31 15 15 60
+    :header-rows: 1
+
+    * - Environment Variable
+      - Type
+      - Default
+      - Description
+    * - FAUCET_CONFIG
+      - Colon-separated list of file paths
+      - /etc/faucet/faucet.yaml:/etc/ryu/faucet/faucet.yaml
+      - Faucet will load it's configuration from the first valid file in list
+    * - FAUCET_CONFIG_STAT_RELOAD
+      - boolean
+      - False
+      - If true, faucet will automatically reload itself and apply new configuration when FAUCET_CONFIG changes
+    * - FAUCET_LOG_LEVEL
+      - `Python log level <https://docs.python.org/3/library/logging.html#levels>`_
+      - INFO
+      - Log verbosity
+    * - FAUCET_LOG
+      - File path or STDOUT or STDERR
+      - /var/log/faucet/faucet.log
+      - Location for faucet to log messages to, can be special values STDOUT or STDERR
+    * - FAUCET_EXCEPTION_LOG
+      - File path  or STDOUT or STDERR
+      - /var/log/faucet/faucet_exception.log
+      - Location for faucet log to log exceptions to, can be special values STDOUT or STDERR
+    * - FAUCET_EVENT_SOCK
+      - Socket path
+      -
+      - Location to a UNIX socket where faucet will write events to, or empty to disable events
+    * - FAUCET_PROMETHEUS_PORT
+      - Port
+      - 9302
+      - TCP port to listen on for faucet prometheus client
+    * - FAUCET_PROMETHEUS_ADDR
+      - IP address
+      - 0.0.0.0
+      - IP address to listen on for faucet prometheus client
+    * - FAUCET_PIPELINE_DIR
+      - Colon-separated list of file paths
+      - /etc/faucet:/etc/ryu/faucet
+      - Faucet will load pipeline definitions from the first valid directory in list
+    * - GAUGE_CONFIG
+      - Colon-separated list of file paths
+      - /etc/faucet/gauge.yaml:/etc/ryu/faucet/gauge.yaml
+      - Guage will load it's configuration from the first valid file in list
+    * - GAUGE_CONFIG_STAT_RELOAD
+      - boolean
+      - False
+      - If true, gauge will automatically reload itself and apply new configuration when GAUGE_CONFIG changes
+    * - GAUGE_LOG_LEVEL
+      - `Python log level <https://docs.python.org/3/library/logging.html#levels>`_
+      - INFO
+      - Log verbosity
+    * - GAUGE_LOG
+      - File path or STDOUT or STDERR
+      - /var/log/faucet/gauge.log
+      - Location for gauge to log messages to, can be special values STDOUT or STDERR
+    * - GAUGE_EXCEPTION_LOG
+      - File path or STDOUT or STDERR
+      - /var/log/faucet/gauge_exception.log
+      - Location for faucet log to log exceptions to, can be special values STDOUT or STDERR
+    * - GAUGE_PROMETHEUS_ADDR
+      - IP address
+      - 0.0.0.0
+      - IP address to listen on for gauge prometheus client

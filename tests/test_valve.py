@@ -48,6 +48,19 @@ from fakeoftable import FakeOFTable
 
 FAUCET_MAC = '0e:00:00:00:00:01'
 
+# TODO: fix fake OF table implementation for in_port filtering
+# (ie. do not output to in_port)
+DP1_CONFIG = """
+        dp_id: 1
+        ignore_learn_ins: 0
+        combinatorial_port_flood: True
+        ofchannel_log: "/dev/null"
+        pipeline_config_dir: '%s/../etc/faucet'
+        lldp_beacon:
+            send_interval: 1
+            max_per_interval: 1
+""" % os.path.dirname(os.path.realpath(__file__))
+
 
 def build_pkt(pkt):
     """Build and return a packet and eth type from a dict."""
@@ -125,14 +138,8 @@ class ValveTestBase(unittest.TestCase):
     CONFIG = """
 dps:
     s1:
-        ignore_learn_ins: 0
-        dp_id: 1
-        ofchannel_log: "/dev/null"
         hardware: 'GenericTFM'
-        pipeline_config_dir: '%s/../etc/ryu/faucet'
-        lldp_beacon:
-            send_interval: 1
-            max_per_interval: 1
+%s
         interfaces:
             p1:
                 number: 1
@@ -164,6 +171,7 @@ dps:
                 native_vlan: v100
     s3:
         hardware: 'Open vSwitch'
+        combinatorial_port_flood: True
         dp_id: 0x3
         stack:
             priority: 1
@@ -233,7 +241,7 @@ vlans:
         vid: 0x300
     v400:
         vid: 0x400
-""" % os.path.dirname(os.path.realpath(__file__))
+""" % DP1_CONFIG
 
     DP = 's1'
     DP_ID = 1
@@ -411,10 +419,10 @@ vlans:
                     self.assertTrue(
                         self.table.is_output(match, port=port.number),
                         msg=('Packet with unknown eth_dst not flooded to stack port %s' % port))
-                else:
+                elif not port.mirror:
                     self.assertFalse(
                         self.table.is_output(match, port=port.number),
-                        msg=('Packet with unknown eth_dst flooded to non-VLAN %s' % port))
+                        msg=('Packet with unknown eth_dst flooded to non-VLAN, non-stack, non-mirror %s' % port))
 
     def rcv_packet(self, port, vid, match):
         """Simulate control plane receiving a packet on a port/VID."""
@@ -436,7 +444,7 @@ vlans:
         msg.cookie = self.valve.dp.cookie
         pkt_meta = self.valve.parse_pkt_meta(msg)
         self.valves_manager.valve_packet_in(self.valve, pkt_meta) # pylint: disable=no-member
-        rcv_packet_ofmsgs = valve_of.valve_flowreorder(self.last_flows_to_dp[self.DP_ID])
+        rcv_packet_ofmsgs = self.last_flows_to_dp[self.DP_ID]
         self.table.apply_ofmsgs(rcv_packet_ofmsgs)
         resolve_ofmsgs = self.valve.resolve_gateways()
         self.table.apply_ofmsgs(resolve_ofmsgs)
@@ -890,9 +898,8 @@ class ValveTestCase(ValveTestBase):
 version: 2
 dps:
     s1:
-        ignore_learn_ins: 0
         hardware: 'Open vSwitch'
-        dp_id: 1
+%s
         interfaces:
             p1:
                 number: 1
@@ -929,7 +936,7 @@ acls:
             dl_type: 0x800
             actions:
                 allow: 0
-"""
+""" % DP1_CONFIG
 
         drop_match = {
             'in_port': 2,
@@ -964,6 +971,66 @@ acls:
         """Test port status change for unknown port handled."""
         self.set_port_up(99)
 
+    def test_move_port(self):
+        self.rcv_packet(2, 0x200, {
+            'eth_src': self.P1_V100_MAC,
+            'eth_dst': self.UNKNOWN_MAC,
+            'vlan_vid': 0x200,
+            'ipv4_src': '10.0.0.2',
+            'ipv4_dst': '10.0.0.3'})
+        self.rcv_packet(4, 0x200, {
+            'eth_src': self.P1_V100_MAC,
+            'eth_dst': self.UNKNOWN_MAC,
+            'vlan_vid': 0x200,
+            'ipv4_src': '10.0.0.2',
+            'ipv4_dst': '10.0.0.3'})
+
+
+class ValveChangePortCase(ValveTestBase):
+
+    CONFIG = """
+dps:
+    s1:
+%s
+        interfaces:
+            p1:
+                number: 1
+                native_vlan: 0x100
+            p2:
+                number: 2
+                native_vlan: 0x200
+                permanent_learn: True
+""" % DP1_CONFIG
+
+    LESS_CONFIG = """
+dps:
+    s1:
+%s
+        interfaces:
+            p1:
+                number: 1
+                native_vlan: 0x100
+            p2:
+                number: 2
+                native_vlan: 0x200
+                permanent_learn: False
+""" % DP1_CONFIG
+
+    def setUp(self):
+        self.setup_valve(self.CONFIG)
+
+    def tearDown(self):
+        self.teardown_valve()
+
+    def test_delete_port(self):
+        self.rcv_packet(2, 0x200, {
+            'eth_src': self.P2_V200_MAC,
+            'eth_dst': self.P3_V200_MAC,
+            'ipv4_src': '10.0.0.2',
+            'ipv4_dst': '10.0.0.3',
+            'vid': 0x200})
+        self.update_config(self.LESS_CONFIG)
+
 
 class ValveACLTestCase(ValveTestBase):
     """Test ACL drop/allow and reloading."""
@@ -979,9 +1046,8 @@ class ValveACLTestCase(ValveTestBase):
         acl_config = """
 dps:
     s1:
-        ignore_learn_ins: 0
         hardware: 'Open vSwitch'
-        dp_id: 1
+%s
         interfaces:
             p1:
                 number: 1
@@ -1018,7 +1084,7 @@ acls:
             dl_type: 0x800
             actions:
                 allow: 0
-"""
+""" % DP1_CONFIG
 
         drop_match = {
             'in_port': 2,
@@ -1053,9 +1119,8 @@ class ValveReloadConfigTestCase(ValveTestCase):
 version: 2
 dps:
     s1:
-        ignore_learn_ins: 0
         hardware: 'Open vSwitch'
-        dp_id: 1
+%s
         interfaces:
             p1:
                 number: 1
@@ -1079,7 +1144,7 @@ vlans:
         vid: 0x200
     v300:
         vid: 0x300
-"""
+""" % DP1_CONFIG
 
     def setUp(self):
         self.setup_valve(self.OLD_CONFIG)
@@ -1131,13 +1196,8 @@ acls:
                 allow: 1
 dps:
     s1:
-        ignore_learn_ins: 0
-        dp_id: 1
         hardware: 'GenericTFM'
-        pipeline_config_dir: '%s/../etc/ryu/faucet'
-        lldp_beacon:
-            send_interval: 1
-            max_per_interval: 1
+%s
         interfaces:
             p1:
                 number: 1
@@ -1182,8 +1242,7 @@ vlans:
             - route:
                 ip_dst: 'fc00::20:0/112'
                 ip_gw: 'fc00::1:99'
-""" % os.path.dirname(os.path.realpath(__file__))
-
+""" % DP1_CONFIG
 
 
 if __name__ == "__main__":

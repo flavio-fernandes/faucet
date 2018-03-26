@@ -108,20 +108,8 @@ vlans:
             links_per_host=self.LINKS_PER_HOST)
         self.start_net()
 
-    def test_untagged(self):
-        """All hosts on the same untagged VLAN should have connectivity."""
-        event_log = os.path.join(self.tmpdir, 'event.log')
-        controller = self._get_controller()
-        controller.cmd(faucet_mininet_test_util.timeout_cmd(
-            'nc -U %s > %s &' % (self.env['faucet']['FAUCET_EVENT_SOCK'], event_log), 120))
-        self.ping_all_when_learned()
-        self.flap_all_switch_ports()
-        self.gauge_smoke_test()
-        self.prometheus_smoke_test()
-        self.assertGreater(os.path.getsize(event_log), 0)
-        controller.cmd(
-            faucet_mininet_test_util.timeout_cmd(
-                'nc -U %s' % self.env['faucet']['FAUCET_EVENT_SOCK'], 10))
+    def verify_events_log(self, event_log):
+        required_events = set(['PORT_CHANGE', 'L2_LEARN', 'PORTS_STATUS'])
         for _ in range(3):
             prom_event_id = self.scrape_prometheus_var('faucet_event_id', dpid=False)
             event_id = None
@@ -129,17 +117,109 @@ vlans:
                 for event_log_line in event_log_file.readlines():
                     event = json.loads(event_log_line.strip())
                     event_id = event['event_id']
+                    for required_event in list(required_events):
+                        if required_event in required_events:
+                            required_events.remove(required_event)
+                            break
             if prom_event_id == event_id:
                 return
             time.sleep(1)
         self.assertEqual(prom_event_id, event_id)
+        self.assertFalse(required_events)
+
+    def test_untagged(self):
+        """All hosts on the same untagged VLAN should have connectivity."""
+        event_log = os.path.join(self.tmpdir, 'event.log')
+        controller = self._get_controller()
+        sock = self.env['faucet']['FAUCET_EVENT_SOCK']
+        controller.cmd(faucet_mininet_test_util.timeout_cmd(
+            'nc -U %s > %s &' % (sock, event_log), 120))
+        self.ping_all_when_learned()
+        self.flap_all_switch_ports()
+        self.gauge_smoke_test()
+        self.prometheus_smoke_test()
+        self.assertGreater(os.path.getsize(event_log), 0)
+        controller.cmd(
+            faucet_mininet_test_util.timeout_cmd(
+                'nc -U %s' % sock, 10))
+        self.verify_events_log(event_log)
+
+
+class FaucetUntaggedNoCombinatorialFlood(FaucetUntaggedTest):
+
+    CONFIG = """
+        combinatorial_port_flood: False
+        interfaces:
+            %(port_1)d:
+                native_vlan: 100
+                description: "b1"
+            %(port_2)d:
+                native_vlan: 100
+                description: "b2"
+            %(port_3)d:
+                native_vlan: 100
+                description: "b3"
+            %(port_4)d:
+                native_vlan: 100
+                description: "b4"
+"""
 
 
 class FaucetUntaggedBroadcastTest(FaucetUntaggedTest):
 
+    UNICAST_MAC1 = '0e:00:00:00:00:02'
+    UNICAST_MAC2 = '0e:00:00:00:00:03'
+
+    def verify_unicast_not_looped(self, host):
+        scapy_template = (
+            'python -c \"from scapy.all import * ; '
+            'sendp(Ether(src=\'%s\', dst=\'%s\')/'
+            'IP(src=\'10.0.0.100\', dst=\'10.0.0.255\')/'
+            'UDP(dport=9)/'
+            'b\'hello\','
+            'iface=\'%s\')\"')
+        host.cmd(
+            scapy_template % (
+                self.UNICAST_MAC1, 'ff:ff:ff:ff:ff:ff', host.defaultIntf()))
+        host.cmd(
+            scapy_template % (
+                self.UNICAST_MAC2, 'ff:ff:ff:ff:ff:ff', host.defaultIntf()))
+        tcpdump_filter = '-Q in ether src %s' % self.UNICAST_MAC1
+        tcpdump_txt = self.tcpdump_helper(
+            host, tcpdump_filter, [
+                lambda: host.cmd(
+                    scapy_template % (
+                        self.UNICAST_MAC1, self.UNICAST_MAC2, host.defaultIntf()))],
+            timeout=5, vflags='-vv', packets=1)
+        self.assertTrue(
+            re.search('0 packets captured', tcpdump_txt), msg=tcpdump_txt)
+
     def test_untagged(self):
-       super(FaucetUntaggedBroadcastTest, self).test_untagged()
-       self.verify_broadcast()
+        super(FaucetUntaggedBroadcastTest, self).test_untagged()
+        self.verify_broadcast()
+        first_host = self.net.hosts[0]
+        self.verify_no_bcast_to_self(first_host)
+        self.verify_unicast_not_looped(first_host)
+
+
+class FaucetUntaggedNoCombinatorialBroadcastTest(FaucetUntaggedBroadcastTest):
+
+    CONFIG = """
+        combinatorial_port_flood: False
+        interfaces:
+            %(port_1)d:
+                native_vlan: 100
+                description: "b1"
+            %(port_2)d:
+                native_vlan: 100
+                description: "b2"
+            %(port_3)d:
+                native_vlan: 100
+                description: "b3"
+            %(port_4)d:
+                native_vlan: 100
+                description: "b4"
+"""
 
 
 class FaucetExperimentalAPITest(FaucetUntaggedTest):
@@ -625,7 +705,7 @@ class FaucetUntaggedInfluxTest(FaucetUntaggedTest):
         db: 'influx'
 """ % (self.DP_NAME, self.DP_NAME, self.DP_NAME)
 
-    def setupInflux(self):
+    def setup_influx(self):
         self.influx_log = os.path.join(self.tmpdir, 'influx.log')
         if self.server:
             self.server.influx_log = self.influx_log
@@ -634,7 +714,7 @@ class FaucetUntaggedInfluxTest(FaucetUntaggedTest):
     def setUp(self):
         self.handler = InfluxPostHandler
         super(FaucetUntaggedInfluxTest, self).setUp()
-        self.setupInflux()
+        self.setup_influx()
 
     def tearDown(self):
         if self.server:
@@ -805,7 +885,7 @@ class FaucetSingleUntaggedInfluxTooSlowTest(FaucetUntaggedInfluxTest):
     def setUp(self):
         self.handler = SlowInfluxPostHandler
         super(FaucetUntaggedInfluxTest, self).setUp()
-        self.setupInflux()
+        self.setup_influx()
 
     def test_untagged(self):
         self.ping_all_when_learned()
@@ -1067,6 +1147,10 @@ vlans:
         self.ping_all_when_learned()
         self.flap_all_switch_ports()
         self.ping_all_when_learned()
+        self.verify_broadcast()
+        # test tagged and untagged hosts
+        for host in self.net.hosts[:2]:
+            self.verify_no_bcast_to_self(host)
 
 
 class FaucetZodiacTaggedAndUntaggedVlanTest(FaucetUntaggedTest):
@@ -2043,7 +2127,6 @@ vlans:
 
     def test_untagged(self):
         self.ping_all_when_learned()
-        self.verify_port1_unicast(True)
         self.assertTrue(self.bogus_mac_flooded_to_port1())
 
 
@@ -2073,7 +2156,6 @@ vlans:
 """
 
     def test_untagged(self):
-        self.verify_port1_unicast(False)
         self.assertFalse(self.bogus_mac_flooded_to_port1())
 
 
@@ -2104,7 +2186,6 @@ vlans:
 """
 
     def test_untagged(self):
-        self.verify_port1_unicast(False)
         # VLAN level config to disable flooding takes precedence,
         # cannot enable port-only flooding.
         self.assertFalse(self.bogus_mac_flooded_to_port1())
@@ -2137,7 +2218,6 @@ vlans:
 """
 
     def test_untagged(self):
-        self.verify_port1_unicast(False)
         self.assertFalse(self.bogus_mac_flooded_to_port1())
 
 
@@ -3237,7 +3317,7 @@ acls:
             'vlan 456.+vlan 123', tcpdump_txt))
 
 
-@unittest.skip('broken in OVS master')
+@unittest.skip('190318: works under OVS 2.9.0 locally, but not under Travis')
 class FaucetUntaggedMultiConfVlansOutputTest(FaucetUntaggedTest):
 
     CONFIG_GLOBAL = """
@@ -3319,6 +3399,56 @@ vlans:
         first_host, second_host, mirror_host = self.net.hosts[0:3]
         self.flap_all_switch_ports()
         self.verify_ping_mirrored(first_host, second_host, mirror_host)
+        self.verify_bcast_ping_mirrored(first_host, second_host, mirror_host)
+
+
+class FaucetUntaggedOutputOverrideTest(FaucetUntaggedTest):
+
+    CONFIG_GLOBAL = """
+vlans:
+    100:
+        description: "untagged"
+        unicast_flood: False
+"""
+
+    CONFIG = """
+        interfaces:
+            %(port_1)d:
+                native_vlan: 100
+                description: "b1"
+                override_output_port: %(port_3)d
+            %(port_2)d:
+                native_vlan: 100
+                description: "b2"
+            %(port_3)d:
+                description: "b3"
+                native_vlan: 100
+            %(port_4)d:
+                native_vlan: 100
+                description: "b4"
+"""
+
+    def test_untagged(self):
+        first_host, second_host, override_host = self.net.hosts[0:3]
+        self.flap_all_switch_ports()
+        first_host.cmd('arp -s %s %s' % (second_host.IP(), second_host.MAC()))
+        second_host.cmd('arp -s %s %s' % (first_host.IP(), first_host.MAC()))
+        tcpdump_filter = (
+            'ether src %s and icmp[icmptype] == 8') % first_host.MAC()
+        tcpdump_txt = self.tcpdump_helper(
+            override_host, tcpdump_filter, [
+                lambda: first_host.cmd('ping -c1 %s' % second_host.IP())])
+        self.assertTrue(re.search(
+            '%s: ICMP echo request' % second_host.IP(), tcpdump_txt),
+                        msg=tcpdump_txt)
+        tcpdump_filter = (
+            'ether src %s and icmp[icmptype] == 8') % second_host.MAC()
+        tcpdump_txt = self.tcpdump_helper(
+            first_host, tcpdump_filter, [
+                lambda: second_host.cmd('ping -c1 %s' % first_host.IP())])
+        self.assertTrue(re.search(
+            '%s: ICMP echo request' % first_host.IP(), tcpdump_txt),
+                        msg=tcpdump_txt)
 
 
 class FaucetUntaggedMultiMirrorTest(FaucetUntaggedTest):
@@ -3436,8 +3566,9 @@ vlans:
 class FaucetTaggedBroadcastTest(FaucetTaggedTest):
 
     def test_tagged(self):
-       super(FaucetTaggedBroadcastTest, self).test_tagged()
-       self.verify_broadcast()
+        super(FaucetTaggedBroadcastTest, self).test_tagged()
+        self.verify_broadcast()
+        self.verify_no_bcast_to_self(self.net.hosts[0])
 
 
 class FaucetTaggedWithUntaggedTest(FaucetTaggedTest):
@@ -3499,6 +3630,7 @@ acls:
             vlan_vid: 100
             actions:
                 mirror: mirrorport
+                force_port_vlan: 1
                 output:
                     swap_vid: 101
                 allow: 1
@@ -3507,7 +3639,7 @@ acls:
     CONFIG = """
         interfaces:
             %(port_1)d:
-                tagged_vlans: [100, 101]
+                tagged_vlans: [100]
                 description: "b1"
                 acl_in: 1
             %(port_2)d:
@@ -4953,7 +5085,7 @@ class FaucetSingleStackAclControlTest(FaucetStringOfDPTest):
                 'dl_dst': 'ff:ff:ff:ff:ff:ff',
                 'actions': {
                     'output': {
-                        'ports': [ 2, 4 ]
+                        'ports': [2, 4]
                     }
                 },
             }},
@@ -5001,7 +5133,7 @@ class FaucetSingleStackAclControlTest(FaucetStringOfDPTest):
                 'dl_dst': 'ff:ff:ff:ff:ff:ff',
                 'actions': {
                     'output': {
-                        'ports': [ 1 ]
+                        'ports': [1]
                     }
                 },
             }},
